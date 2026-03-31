@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Flash-MoE | Qwen3-235B</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #58a6ff;
+    --accent-dim: #1f6feb;
+    --user-bg: #1c2333;
+    --assistant-bg: #161b22;
+    --green: #3fb950;
+    --red: #f85149;
+    --font: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif;
+    --mono: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-shrink: 0;
+  }
+
+  header h1 {
+    font-size: 15px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .model-badge {
+    font-size: 11px;
+    font-weight: 500;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background: var(--accent-dim);
+    color: var(--accent);
+  }
+
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--red);
+  }
+
+  .status-dot.connected { background: var(--green); }
+
+  #messages {
+    flex: 1;
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .message {
+    max-width: 780px;
+    width: 100%;
+    margin: 0 auto;
+    padding: 12px 16px;
+    border-radius: 8px;
+    line-height: 1.6;
+    font-size: 14px;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+
+  .message.user {
+    background: var(--user-bg);
+    border: 1px solid var(--border);
+  }
+
+  .message.assistant {
+    background: transparent;
+  }
+
+  .message .role {
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+  }
+
+  .message.user .role { color: var(--accent); }
+  .message.assistant .role { color: var(--green); }
+
+  .message .content {
+    font-family: var(--font);
+  }
+
+  .message .meta {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: var(--mono);
+  }
+
+  .cursor {
+    display: inline-block;
+    width: 7px;
+    height: 15px;
+    background: var(--accent);
+    animation: blink 0.8s step-end infinite;
+    vertical-align: text-bottom;
+    margin-left: 1px;
+  }
+
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .thinking {
+    color: var(--text-muted);
+    font-style: italic;
+  }
+
+  #input-area {
+    border-top: 1px solid var(--border);
+    padding: 16px 20px;
+    flex-shrink: 0;
+  }
+
+  .input-row {
+    max-width: 780px;
+    margin: 0 auto;
+    display: flex;
+    gap: 8px;
+  }
+
+  #prompt {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 14px;
+    resize: none;
+    outline: none;
+    min-height: 42px;
+    max-height: 200px;
+  }
+
+  #prompt:focus { border-color: var(--accent); }
+
+  #prompt::placeholder { color: var(--text-muted); }
+
+  button {
+    background: var(--accent-dim);
+    color: var(--text);
+    border: none;
+    border-radius: 8px;
+    padding: 10px 18px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.15s;
+    white-space: nowrap;
+  }
+
+  button:hover { background: var(--accent); color: #000; }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  #settings {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    max-width: 780px;
+    margin: 8px auto 0;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  #settings label { display: flex; align-items: center; gap: 4px; }
+
+  #settings input[type="number"] {
+    width: 60px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 6px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+
+  .welcome {
+    text-align: center;
+    padding: 60px 20px;
+    color: var(--text-muted);
+  }
+
+  .welcome h2 {
+    font-size: 20px;
+    color: var(--text);
+    margin-bottom: 8px;
+  }
+
+  .welcome p { font-size: 13px; line-height: 1.6; }
+
+  .stats {
+    font-family: var(--mono);
+    font-size: 11px;
+    margin-top: 12px;
+    color: var(--text-muted);
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>
+    Flash-MoE
+    <span class="model-badge">Qwen3-235B-A22B</span>
+  </h1>
+  <div class="status">
+    <span class="status-dot" id="statusDot"></span>
+    <span id="statusText">Disconnected</span>
+  </div>
+</header>
+
+<div id="messages">
+  <div class="welcome">
+    <h2>Qwen3-235B-A22B</h2>
+    <p>235 billion parameters running locally via Flash-MoE<br>
+    SSD expert streaming on Apple Silicon</p>
+    <div class="stats" id="welcomeStats"></div>
+  </div>
+</div>
+
+<div id="input-area">
+  <div class="input-row">
+    <textarea id="prompt" rows="1" placeholder="Send a message..." autofocus></textarea>
+    <button id="sendBtn" onclick="sendMessage()">Send</button>
+    <button id="stopBtn" onclick="stopGeneration()" style="display:none">Stop</button>
+  </div>
+  <div id="settings">
+    <label>Max tokens <input type="number" id="maxTokens" value="512" min="1" max="4096"></label>
+    <label>Port <input type="number" id="port" value="8080" min="1024" max="65535"></label>
+    <button onclick="checkHealth()" style="padding:4px 10px;font-size:11px">Check</button>
+    <button onclick="clearChat()" style="padding:4px 10px;font-size:11px;background:transparent;border:1px solid var(--border)">Clear</button>
+  </div>
+</div>
+
+<script>
+const messagesEl = document.getElementById('messages');
+const promptEl = document.getElementById('prompt');
+const sendBtn = document.getElementById('sendBtn');
+const stopBtn = document.getElementById('stopBtn');
+const statusDot = document.getElementById('statusDot');
+const statusText = document.getElementById('statusText');
+
+let controller = null;
+let generating = false;
+
+function getBaseUrl() {
+  return `http://localhost:${document.getElementById('port').value}`;
+}
+
+async function checkHealth() {
+  try {
+    const r = await fetch(`${getBaseUrl()}/health`, { signal: AbortSignal.timeout(3000) });
+    if (r.ok) {
+      statusDot.className = 'status-dot connected';
+      statusText.textContent = 'Connected';
+      const data = await r.json().catch(() => null);
+      if (data) {
+        document.getElementById('welcomeStats').textContent =
+          `K=${data.k || '?'} experts | ${data.layers || '94'} layers | ${data.quant || '4-bit'}`;
+      }
+    } else {
+      throw new Error('Not OK');
+    }
+  } catch {
+    statusDot.className = 'status-dot';
+    statusText.textContent = 'Disconnected';
+  }
+}
+
+function addMessage(role, content, meta) {
+  // Remove welcome message
+  const welcome = messagesEl.querySelector('.welcome');
+  if (welcome) welcome.remove();
+
+  const div = document.createElement('div');
+  div.className = `message ${role}`;
+  div.innerHTML = `<div class="role">${role}</div><div class="content"></div>`;
+  if (meta) {
+    const metaEl = document.createElement('div');
+    metaEl.className = 'meta';
+    metaEl.textContent = meta;
+    div.appendChild(metaEl);
+  }
+  messagesEl.appendChild(div);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+  return div.querySelector('.content');
+}
+
+function scrollToBottom() {
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+async function sendMessage() {
+  const text = promptEl.value.trim();
+  if (!text || generating) return;
+
+  addMessage('user', text);
+  promptEl.value = '';
+  promptEl.style.height = 'auto';
+
+  generating = true;
+  sendBtn.style.display = 'none';
+  stopBtn.style.display = 'inline-block';
+
+  const contentEl = addMessage('assistant', '');
+  const cursorEl = document.createElement('span');
+  cursorEl.className = 'cursor';
+  contentEl.appendChild(cursorEl);
+
+  const maxTokens = parseInt(document.getElementById('maxTokens').value) || 512;
+  let fullText = '';
+  let tokenCount = 0;
+  const t0 = performance.now();
+  let ttft = 0;
+
+  try {
+    controller = new AbortController();
+    const resp = await fetch(`${getBaseUrl()}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'qwen3-235b',
+        messages: [{ role: 'user', content: text }],
+        max_tokens: maxTokens,
+        stream: true
+      }),
+      signal: controller.signal
+    });
+
+    statusDot.className = 'status-dot connected';
+    statusText.textContent = 'Generating...';
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') continue;
+
+        try {
+          const parsed = JSON.parse(data);
+          const delta = parsed.choices?.[0]?.delta?.content;
+          if (delta) {
+            if (tokenCount === 0) ttft = performance.now() - t0;
+            fullText += delta;
+            tokenCount++;
+
+            // Handle think tags
+            let display = fullText
+              .replace(/<think>/g, '')
+              .replace(/<\/think>/g, '');
+
+            contentEl.textContent = display;
+            contentEl.appendChild(cursorEl);
+            scrollToBottom();
+          }
+        } catch {}
+      }
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') {
+      contentEl.textContent = fullText || `Error: ${e.message}`;
+    }
+  }
+
+  // Remove cursor, add stats
+  cursorEl.remove();
+  const elapsed = (performance.now() - t0) / 1000;
+  const tokPerSec = tokenCount / (elapsed - ttft / 1000) || 0;
+  const meta = `${tokenCount} tokens | ${elapsed.toFixed(1)}s | TTFT ${(ttft/1000).toFixed(1)}s | ${tokPerSec.toFixed(1)} tok/s`;
+  const metaEl = document.createElement('div');
+  metaEl.className = 'meta';
+  metaEl.textContent = meta;
+  contentEl.parentElement.appendChild(metaEl);
+
+  generating = false;
+  sendBtn.style.display = 'inline-block';
+  stopBtn.style.display = 'none';
+  statusDot.className = 'status-dot connected';
+  statusText.textContent = 'Connected';
+  controller = null;
+}
+
+function stopGeneration() {
+  if (controller) controller.abort();
+  generating = false;
+  sendBtn.style.display = 'inline-block';
+  stopBtn.style.display = 'none';
+  statusText.textContent = 'Connected';
+}
+
+function clearChat() {
+  messagesEl.innerHTML = `
+    <div class="welcome">
+      <h2>Qwen3-235B-A22B</h2>
+      <p>235 billion parameters running locally via Flash-MoE<br>
+      SSD expert streaming on Apple Silicon</p>
+      <div class="stats" id="welcomeStats"></div>
+    </div>`;
+}
+
+// Auto-resize textarea
+promptEl.addEventListener('input', () => {
+  promptEl.style.height = 'auto';
+  promptEl.style.height = Math.min(promptEl.scrollHeight, 200) + 'px';
+});
+
+// Enter to send, Shift+Enter for newline
+promptEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+// Check health on load
+checkHealth();
+</script>
+</body>
+</html>
