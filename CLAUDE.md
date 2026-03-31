@@ -1,10 +1,20 @@
-# Flash-MoE: Running a 397B Parameter Model on a Laptop
+# Flash-MoE: Qwen3-235B-A22B on a Mac mini (24GB)
 
-> **[Read the paper](paper/flash_moe.pdf)** — Full technical details, 90+ experiments, and the story of how an AI and a human built this in 24 hours.
+> Forked from [danveloper/flash-moe](https://github.com/danveloper/flash-moe). Original paper and experiments in `paper/`.
 
-Pure C/Metal inference engine that runs **Qwen3.5-397B-A17B** (a 397 billion parameter Mixture-of-Experts model) on a MacBook Pro with 48GB RAM at **4.4+ tokens/second** with production-quality output including tool calling.
+Pure C/Metal inference engine ported to run **Qwen3-235B-A22B** (a 235 billion parameter Mixture-of-Experts model) on a Mac mini M4 Pro with 24GB RAM.
 
-The entire 209GB model streams from SSD through a custom Metal compute pipeline. No Python. No frameworks. Just C, Objective-C, and hand-tuned Metal shaders.
+The ~119GB model (4-bit) streams from SSD through a custom Metal compute pipeline. No Python. No frameworks. Just C, Objective-C, and hand-tuned Metal shaders.
+
+## Changes from upstream (Qwen3.5-397B)
+- Removed GatedDeltaNet linear attention (all 94 layers use standard GQA)
+- Removed shared expert system (Qwen3 uses global-batch load balancing)
+- Scaled KV cache from 15 to 94 layers
+- Updated model constants: 128 experts (was 512), moe_intermediate=1536 (was 1024)
+- 64 attention heads with head_dim=128 (was 32 heads, head_dim=256)
+- Full RoPE rotation, theta=1M (was partial, theta=10M)
+- Rewrote repack_experts.py for MLX fused tensor format
+- Default K=4 active experts to optimize for 24GB page cache
 
 ## Results
 

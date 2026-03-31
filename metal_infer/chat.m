@@ -536,7 +536,7 @@ int main(int argc, char **argv) {
     }
 
     printf("==================================================\n");
-    printf("  Qwen3.5-397B-A17B Chat (Flash-MoE)\n");
+    printf("  Qwen3-235B-A22B Chat (Flash-MoE)\n");
     printf("==================================================\n");
     printf("  Server:  http://localhost:%d\n", port);
     printf("  Session: %s%s\n", session_id, resume_id ? " (resumed)" : "");

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-extract_weights.py — Extract all non-expert weights from Qwen3.5-397B-A17B-4bit
+extract_weights.py — Extract all non-expert weights from Qwen3-235B-A22B-4bit
 into a single binary file that the C inference engine can mmap.
 
 Outputs:
@@ -25,7 +25,6 @@ import time
 from pathlib import Path
 from collections import defaultdict
 import re
-import numpy as np
 
 
 def parse_safetensors_header(filepath):
@@ -34,20 +33,16 @@ def parse_safetensors_header(filepath):
         header_len = struct.unpack('<Q', f.read(8))[0]
         header = json.loads(f.read(header_len))
         data_start = 8 + header_len
+    header.pop('__metadata__', None)
     return header, data_start
 
 
 def main():
     parser = argparse.ArgumentParser(description='Extract non-expert weights to binary')
-    parser.add_argument('--model', type=str,
-                        default=os.path.expanduser(
-                            '~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit'
-                            '/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3'),
-                        help='Path to model directory')
+    parser.add_argument('--model', type=str, required=True,
+                        help='Path to mlx-community/Qwen3-235B-A22B-4bit model directory')
     parser.add_argument('--output', type=str, default='.',
                         help='Output directory for model_weights.bin and .json')
-    parser.add_argument('--include-experts', action='store_true',
-                        help='Also extract expert weights (huge, not recommended)')
     args = parser.parse_args()
 
     model_path = Path(args.model)
@@ -65,28 +60,20 @@ def main():
 
     weight_map = idx['weight_map']
 
-    # Filter: keep only language_model weights, skip vision_tower
-    # Also skip expert weights (switch_mlp.{gate_proj,up_proj,down_proj}.{weight,scales,biases})
-    # unless --include-experts is set
+    # Skip expert weights (switch_mlp.{gate_proj,up_proj,down_proj}.{weight,scales,biases})
     expert_pattern = re.compile(r'\.switch_mlp\.(gate_proj|up_proj|down_proj)\.(weight|scales|biases)$')
-    vision_pattern = re.compile(r'^(vision_tower|model\.visual)')
 
-    tensors_to_extract = {}  # name -> filename
+    tensors_to_extract = {}
     skipped_expert = 0
-    skipped_vision = 0
 
     for name, filename in weight_map.items():
-        if vision_pattern.match(name):
-            skipped_vision += 1
-            continue
-        if not args.include_experts and expert_pattern.search(name):
+        if expert_pattern.search(name):
             skipped_expert += 1
             continue
         tensors_to_extract[name] = filename
 
     print(f"Model: {model_path}")
     print(f"Total weights in index: {len(weight_map)}")
-    print(f"Skipped vision: {skipped_vision}")
     print(f"Skipped expert: {skipped_expert}")
     print(f"Extracting: {len(tensors_to_extract)} tensors")
 
@@ -95,22 +82,21 @@ def main():
     for name, filename in tensors_to_extract.items():
         by_file[filename].append(name)
 
-    # Parse headers and plan layout
+    # Parse headers
     print("\nParsing safetensors headers...")
     header_cache = {}
     for filename in sorted(by_file.keys()):
         filepath = model_path / filename
         header_cache[filename] = parse_safetensors_header(str(filepath))
 
-    # Sanitize tensor names: remove "language_model." prefix for the C engine
+    # Sanitize tensor names: remove "model." prefix for the C engine
     def sanitize_name(name):
-        if name.startswith("language_model."):
-            return name[len("language_model."):]
+        if name.startswith("model."):
+            return name[len("model."):]
         return name
 
-    # Plan the output layout
-    # Sort tensors for deterministic output
-    all_tensors = []  # (sanitized_name, original_name, filename)
+    # Plan the output layout (sorted for deterministic output)
+    all_tensors = []
     for name in sorted(tensors_to_extract.keys()):
         san_name = sanitize_name(name)
         all_tensors.append((san_name, name, tensors_to_extract[name]))
@@ -121,38 +107,24 @@ def main():
         "model": str(model_path),
         "num_tensors": len(all_tensors),
         "tensors": {},
-        # Model config for the C engine
         "config": {
             "hidden_size": 4096,
-            "num_hidden_layers": 60,
-            "num_attention_heads": 32,
-            "num_key_value_heads": 2,
-            "head_dim": 256,
-            "vocab_size": 248320,
+            "num_hidden_layers": 94,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 4,
+            "head_dim": 128,
+            "vocab_size": 151936,
             "rms_norm_eps": 1e-6,
-            "num_experts": 512,
-            "num_experts_per_tok": 10,
-            "moe_intermediate_size": 1024,
-            "shared_expert_intermediate_size": 1024,
-            "full_attention_interval": 4,
-            "linear_num_value_heads": 64,
-            "linear_num_key_heads": 16,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "partial_rotary_factor": 0.25,
-            "rope_theta": 10000000.0,
+            "num_experts": 128,
+            "num_experts_per_tok": 8,
+            "moe_intermediate_size": 1536,
+            "rope_theta": 1000000.0,
+            "norm_topk_prob": True,
         }
     }
 
-    # Layer type map
-    layer_types = []
-    for i in range(60):
-        if (i + 1) % 4 == 0:
-            layer_types.append("full_attention")
-        else:
-            layer_types.append("linear_attention")
-    manifest["config"]["layer_types"] = layer_types
+    # All layers are standard GQA + MoE
+    manifest["config"]["layer_types"] = ["gqa_moe"] * 94
 
     print(f"\nWriting {bin_path}...")
     t0 = time.time()
@@ -225,18 +197,10 @@ def main():
             cat = "lm_head"
         elif "input_layernorm" in san_name or "post_attention_layernorm" in san_name:
             cat = "layer_norms"
-        elif "linear_attn" in san_name:
-            cat = "linear_attention"
         elif "self_attn" in san_name:
-            cat = "full_attention"
+            cat = "attention"
         elif "mlp.gate." in san_name:
             cat = "routing_gate"
-        elif "shared_expert." in san_name:
-            cat = "shared_expert"
-        elif "shared_expert_gate" in san_name:
-            cat = "shared_expert_gate"
-        elif "switch_mlp" in san_name:
-            cat = "routed_experts"
         else:
             cat = "other"
         categories[cat]["count"] += 1

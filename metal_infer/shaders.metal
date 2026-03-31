@@ -1,6 +1,8 @@
 /*
  * shaders.metal — Optimized Metal compute shaders for 4-bit quantized MoE inference
  *
+ * Architecture: Qwen3-235B-A22B
+ *
  * Core operations:
  *   1. dequant_matvec_4bit: Naive 4-bit affine dequant matvec (reference)
  *   2. dequant_matvec_4bit_fast: SIMD-optimized with simd_sum reduction
@@ -16,13 +18,13 @@
  *   - Dequantized value = uint4_val * scale + bias
  *   - Groups of 64 elements share one (scale, bias) pair
  *
- * Matrix layout for expert projections:
- *   gate_proj/up_proj: [1024, 512] uint32 = [1024, 4096] logical (out=1024, in=4096)
- *   down_proj: [4096, 128] uint32 = [4096, 1024] logical (out=4096, in=1024)
+ * Matrix layout for expert projections (Qwen3-235B, MOE_INTERMEDIATE=1536):
+ *   gate_proj/up_proj: [1536, 512] uint32 = [1536, 4096] logical (out=1536, in=4096)
+ *   down_proj: [4096, 192] uint32 = [4096, 1536] logical (out=4096, in=1536)
  *
  *   Scales/biases: [out_dim, in_dim/group_size]
- *   gate/up scales: [1024, 64]   (4096/64 = 64 groups)
- *   down scales:    [4096, 16]   (1024/64 = 16 groups)
+ *   gate/up scales: [1536, 64]   (4096/64 = 64 groups)
+ *   down scales:    [4096, 24]   (1536/64 = 24 groups)
  */
 
 #include <metal_stdlib>
@@ -1011,6 +1013,12 @@ kernel void sigmoid_gate(
 
 
 // ============================================================================
+// Kernels 10-14: GatedDeltaNet / linear attention kernels REMOVED
+// (Qwen3-235B uses standard GQA attention only, no linear attention)
+// ============================================================================
+
+#if 0  // Dead code: linear attention kernels removed for Qwen3-235B port
+// ============================================================================
 // Kernel 10: GatedDeltaNet linear attention step (single token, all heads)
 // ============================================================================
 //
@@ -1244,23 +1252,26 @@ kernel void gated_rms_norm(
         output[base + tid] = normed * gate * w;
     }
 }
+#endif  // Dead code: linear attention kernels
 
 
 // ============================================================================
-// Kernel 12: MoE combine + residual + shared expert gate (fused)
+// Kernel 12: MoE combine + residual (fused, no shared expert)
 // ============================================================================
-// Fused operation for CMD3 GPU-side combine:
+// Fused operation for CMD3 GPU-side combine (Qwen3: no shared expert):
 //   hidden[i] = h_mid[i] + sum_k(expert_weight[k] * expert_out[k][i])
-//               + sigmoid(shared_gate_score) * shared_out[i]
 //
 // All 8 expert output buffers are always bound (unused ones have weight=0).
 // This avoids variable buffer bindings and keeps the dispatch simple.
+//
+// Buffer 1 (shared_out) is kept as a dummy binding for call-site compatibility
+// but its contents are ignored.
 //
 // Dispatch: (dim + 255) / 256 threadgroups, 256 threads each.
 
 kernel void moe_combine_residual(
     device const float* h_mid       [[buffer(0)]],   // [dim]
-    device const float* shared_out  [[buffer(1)]],   // [dim]
+    device const float* shared_out  [[buffer(1)]],   // [dim] UNUSED (kept for binding compat)
     device float*       hidden_out  [[buffer(2)]],   // [dim] output
     device const float* expert_out0 [[buffer(3)]],   // [dim] expert 0
     device const float* expert_out1 [[buffer(4)]],   // [dim] expert 1
@@ -1270,17 +1281,14 @@ kernel void moe_combine_residual(
     device const float* expert_out5 [[buffer(8)]],   // [dim] expert 5
     device const float* expert_out6 [[buffer(9)]],   // [dim] expert 6
     device const float* expert_out7 [[buffer(10)]],  // [dim] expert 7
-    device const float* params      [[buffer(11)]],  // [10]: weights[0..7], shared_gate_score, (unused)
+    device const float* params      [[buffer(11)]],  // [10]: weights[0..7], (unused), (unused)
     constant uint&      dim         [[buffer(12)]],
     constant uint&      K           [[buffer(13)]],
     uint tid [[thread_position_in_grid]]
 ) {
     if (tid >= dim) return;
 
-    // Read expert weights and shared gate from params buffer
-    float shared_gate = 1.0f / (1.0f + exp(-params[8]));  // sigmoid(shared_gate_score)
-
-    // Weighted sum of expert outputs
+    // Weighted sum of expert outputs (no shared expert in Qwen3)
     float moe = 0.0f;
     // Unrolled for MAX_K=8 with branch on K to avoid reading invalid buffers
     if (K > 0) moe += params[0] * expert_out0[tid];
@@ -1292,5 +1300,5 @@ kernel void moe_combine_residual(
     if (K > 6) moe += params[6] * expert_out6[tid];
     if (K > 7) moe += params[7] * expert_out7[tid];
 
-    hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
+    hidden_out[tid] = h_mid[tid] + moe;
 }

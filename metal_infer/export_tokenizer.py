@@ -23,9 +23,7 @@ import sys
 
 def main():
     tok_path = sys.argv[1] if len(sys.argv) > 1 else (
-        '/Users/danielwoods/.cache/huggingface/hub/'
-        'models--mlx-community--Qwen3.5-397B-A17B-4bit/'
-        'snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3/tokenizer.json'
+        '/Users/kurtsaid/models/Qwen3-235B-A22B-4bit/tokenizer.json'
     )
     out_path = sys.argv[2] if len(sys.argv) > 2 else 'tokenizer.bin'
 

@@ -1,40 +1,37 @@
 /*
- * infer.m — Complete Qwen3.5-397B inference engine using Metal
+ * infer.m — Complete Qwen3-235B-A22B inference engine using Metal
  *
- * Full forward pass: embedding -> 60 transformer layers -> norm -> lm_head -> sample
+ * Full forward pass: embedding -> 94 transformer layers -> norm -> lm_head -> sample
  * Non-expert weights loaded from model_weights.bin (mmap'd at startup)
  * Expert weights loaded from packed_experts/ per layer per token (pread)
  *
- * Architecture: Qwen3.5-397B-A17B (MoE)
- *   - 60 layers: 45 linear attention (GatedDeltaNet) + 15 full attention
- *   - hidden_size=4096, head_dim=256, num_attention_heads=32, num_kv_heads=2
- *   - 512 experts/layer, 10 active (we use K=4 for speed)
- *   - Shared expert per layer (always active)
- *   - Linear attention: conv1d(kernel=4) + gated delta recurrence
- *   - Full attention: standard QKV + scaled dot product + RoPE
+ * Architecture: Qwen3-235B-A22B (MoE)
+ *   - 94 layers: ALL standard GQA attention (no linear attention)
+ *   - hidden_size=4096, head_dim=128, num_attention_heads=64, num_kv_heads=4
+ *   - 128 experts/layer, 8 active (we use K=4 for speed)
+ *   - No shared expert (Qwen3 does not have shared experts)
+ *   - Full RoPE rotation (rotary_dim = head_dim = 128)
  *
  * Command buffer optimization (fused_layer_forward):
  *   Per-layer Metal command buffer structure:
- *     CMD1: attention input projections (3-4 dispatches, 1 commit)
- *     CPU:  attention compute (RoPE/softmax/delta-net)
- *     CMD2: o_proj + residual_add + rms_norm + routing + shared gate/up (8 encoders, 1 commit)
+ *     CMD1: attention input projections (3 dispatches, 1 commit)
+ *     CPU:  attention compute (RoPE/softmax)
+ *     CMD2: o_proj + residual_add + rms_norm + routing (5 encoders, 1 commit)
  *           GPU handles residual connection and post-attn norm internally,
  *           eliminating the CPU round-trip that previously split this into 2 cmd buffers.
  *     CPU:  softmax + top-K + pread all K experts (4 pthreads parallel)
- *     CMD3: all K expert forwards + shared SwiGLU + shared down
+ *     CMD3: all K expert forwards
  *           + GPU-side combine + residual_add + rms_norm -> buf_input (DEFERRED commit)
- *           Batched encoding: 4 encoders for K experts + 2 shared + 3 combine = 9 total
+ *           Batched encoding: 2 encoders per expert + 3 combine = K*2 + 3 total
  *   Total: 3 cmd buffers per layer. CMD3 is submitted async (commit without wait).
  *   GPU-side combine in CMD3: for non-last layers, CMD3 also computes:
- *     moe_combine_residual (weighted sum + residual + shared gate -> hidden)
+ *     moe_combine_residual (weighted sum + residual -> hidden)
  *     rms_norm (hidden -> buf_input using NEXT layer's input_norm weights)
  *   This allows the next layer's CMD1 to submit immediately without waiting
  *   for CMD3 completion — the GPU queue serializes CMD3(N-1) then CMD1(N).
- *   Saves ~0.83ms/layer deferred_wait + CPU combine + input_norm overhead.
  *   Multi-expert buffers (MAX_K=8 independent slots) allow all K expert
  *   forwards to be encoded into a single command buffer.
  *   Batched encoding: 2 encoders per expert (gate+up fused, SwiGLU+down fused)
- *   + 2 for shared expert = K*2 + 2 total encoders in CMD3.
  *   Double-buffered expert data (buf_multi_expert_data / data_B) for future
  *   async pread overlap with GPU compute.
  *
@@ -66,43 +63,42 @@
 #include <compression.h>
 
 // ============================================================================
-// Model constants
+// Model constants — Qwen3-235B-A22B
 // ============================================================================
 
 #define HIDDEN_DIM          4096
-#define NUM_LAYERS          60
-#define NUM_ATTN_HEADS      32
-#define NUM_KV_HEADS        2
-#define HEAD_DIM            256
-#define VOCAB_SIZE          248320
+#define NUM_LAYERS          94
+#define NUM_ATTN_HEADS      64
+#define NUM_KV_HEADS        4
+#define HEAD_DIM            128
+#define VOCAB_SIZE          151936
 #define RMS_NORM_EPS        1e-6f
-#define NUM_EXPERTS         512
-#define NUM_EXPERTS_PER_TOK 10
-#define MOE_INTERMEDIATE    1024
-#define SHARED_INTERMEDIATE 1024
-#define FULL_ATTN_INTERVAL  4
+#define NUM_EXPERTS         128
+#define NUM_EXPERTS_PER_TOK 8
+#define MOE_INTERMEDIATE    1536
 #define GROUP_SIZE          64
 #define BITS                4
 
-// Linear attention (GatedDeltaNet) constants
-#define LINEAR_NUM_V_HEADS  64
-#define LINEAR_NUM_K_HEADS  16
-#define LINEAR_KEY_DIM      128   // head_k_dim
-#define LINEAR_VALUE_DIM    128   // head_v_dim
-#define LINEAR_TOTAL_KEY    (LINEAR_NUM_K_HEADS * LINEAR_KEY_DIM)   // 2048
-#define LINEAR_TOTAL_VALUE  (LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM) // 8192
-#define LINEAR_CONV_DIM     (LINEAR_TOTAL_KEY * 2 + LINEAR_TOTAL_VALUE) // 12288
-#define CONV_KERNEL_SIZE    4
+// Full attention constants (all layers are standard GQA — no linear attention)
+#define ROPE_THETA          1000000.0f
+#define PARTIAL_ROTARY      1.0f
+#define ROTARY_DIM          (int)(HEAD_DIM * PARTIAL_ROTARY)  // 128 (full rotation)
 
-// Full attention constants
-#define ROPE_THETA          10000000.0f
-#define PARTIAL_ROTARY      0.25f
-#define ROTARY_DIM          (int)(HEAD_DIM * PARTIAL_ROTARY)  // 64
+// Expert packed binary layout — 4-bit, MOE_INTERMEDIATE=1536, HIDDEN_DIM=4096
+// gate_proj/up_proj: [1536, 512] uint32 = [1536, 4096] logical
+// down_proj: [4096, 192] uint32 = [4096, 1536] logical
+#define EXPERT_SIZE         10616832
+// gate_w: [1536, 512] uint32 = 1536*512*4 = 3145728
+// gate_s: [1536, 64] bf16 = 1536*64*2 = 196608
+// gate_b: [1536, 64] bf16 = 196608
+// up_w:   [1536, 512] uint32 = 3145728
+// up_s:   [1536, 64] bf16 = 196608
+// up_b:   [1536, 64] bf16 = 196608
+// down_w: [4096, 192] uint32 = 4096*192*4 = 3145728
+// down_s: [4096, 24] bf16 = 4096*24*2 = 196608
+// down_b: [4096, 24] bf16 = 196608
 
-// Expert packed binary layout (from existing code)
-#define EXPERT_SIZE         7077888
-
-// 2-bit expert layout (from repack_experts_2bit.py)
+// TODO: 2-bit expert layout needs recalculation for Qwen3-235B dimensions
 #define EXPERT_SIZE_2BIT    3932160
 #define GATE_W_OFF_2  0
 #define GATE_S_OFF_2  1048576
@@ -115,16 +111,17 @@
 #define DOWN_B_OFF_2  3801088
 
 // KV cache maximum context length
-#define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
-#define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
+#define MAX_SEQ_LEN 1048576  // 1M context — all 94 layers need KV cache
+#define GPU_KV_SEQ  4096     // GPU KV buffer pre-allocation (save memory on 24GB)
 
-// Special tokens
-#define EOS_TOKEN_1         248046
-#define EOS_TOKEN_2         248044
-#define THINK_START_TOKEN   248068  // <think>
-#define THINK_END_TOKEN     248069  // </think>
+// Special tokens (Qwen3 vocabulary)
+#define EOS_TOKEN_1         151645
+#define EOS_TOKEN_2         151643
+// TODO: verify exact Qwen3 think token IDs from tokenizer
+#define THINK_START_TOKEN   151667  // <think>
+#define THINK_END_TOKEN     151668  // </think>
 
-#define MODEL_PATH_DEFAULT "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+#define MODEL_PATH_DEFAULT "/Users/kurtsaid/models/Qwen3-235B-A22B-4bit"
 
 // ============================================================================
 // Timing helper
@@ -859,35 +856,7 @@ static void cpu_silu(float *x, int dim) {
     }
 }
 
-// Conv1d depthwise: one step (for incremental inference)
-// Input: conv_state[kernel_size-1][channels] + new_input[channels]
-// Output: result[channels]
-// Weight: [channels, kernel_size, 1] stored as bf16
-// This is a depthwise conv1d: each channel is independent
-static void cpu_conv1d_step(
-    const float *conv_state,    // [(kernel_size-1) * channels] row-major
-    const float *new_input,     // [channels]
-    const uint16_t *weight_bf16, // [channels * kernel_size] flattened
-    float *out,                 // [channels]
-    int channels,
-    int kernel_size
-) {
-    // For each channel, compute dot product of [conv_state..., new_input] with weight
-    for (int c = 0; c < channels; c++) {
-        float acc = 0.0f;
-        // Process previous states from conv_state
-        for (int k = 0; k < kernel_size - 1; k++) {
-            float w = bf16_to_f32(weight_bf16[c * kernel_size + k]);
-            acc += conv_state[k * channels + c] * w;
-        }
-        // Process new input (last position in kernel)
-        float w = bf16_to_f32(weight_bf16[c * kernel_size + (kernel_size - 1)]);
-        acc += new_input[c] * w;
-        out[c] = acc;
-    }
-    // Apply SiLU
-    cpu_silu(out, channels);
-}
+// (cpu_conv1d_step removed — Qwen3-235B uses standard GQA attention only, no linear attention)
 
 // ============================================================================
 // Metal context for GPU-accelerated matmuls
@@ -914,7 +883,6 @@ typedef struct {
     id<MTLComputePipelineState> attn_scores_pipe;
     id<MTLComputePipelineState> attn_softmax_pipe;
     id<MTLComputePipelineState> attn_values_pipe;
-    id<MTLComputePipelineState> sigmoid_gate_pipe;
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [HIDDEN_DIM or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
@@ -942,24 +910,16 @@ typedef struct {
     id<MTLBuffer> buf_multi_expert_act[MAX_K];    // [MOE_INTERMEDIATE floats]
     id<MTLBuffer> buf_multi_expert_out[MAX_K];    // [HIDDEN_DIM floats]
     id<MTLBuffer> buf_multi_expert_input;         // [HIDDEN_DIM floats] (shared, read-only during dispatch)
-    // Shared expert buffers for fused CMD2 (shared gate/up computed in CMD1,
-    // SwiGLU + down_proj in CMD2 alongside routed experts)
-    id<MTLBuffer> buf_shared_gate;   // [SHARED_INTERMEDIATE floats]
-    id<MTLBuffer> buf_shared_up;     // [SHARED_INTERMEDIATE floats]
-    id<MTLBuffer> buf_shared_act;    // [SHARED_INTERMEDIATE floats] (SwiGLU output)
-    id<MTLBuffer> buf_shared_out;    // [HIDDEN_DIM floats] (down_proj output)
     // Fused o_proj+norm+routing buffers (eliminates 1 cmd buffer per layer)
     id<MTLBuffer> buf_residual;     // [HIDDEN_DIM floats] holds residual for GPU add
     id<MTLBuffer> buf_h_mid;        // [HIDDEN_DIM floats] residual+oproj result
     id<MTLBuffer> buf_sum_sq;       // [1 float] for RMS norm reduction
-    // GPU attention buffers (for full attention layers)
-    #define NUM_FULL_ATTN_LAYERS 15
-    id<MTLBuffer> buf_kv_k[NUM_FULL_ATTN_LAYERS];  // K cache per full-attn layer
-    id<MTLBuffer> buf_kv_v[NUM_FULL_ATTN_LAYERS];  // V cache per full-attn layer
+    // GPU attention buffers (all layers are full attention in Qwen3-235B)
+    id<MTLBuffer> buf_kv_k[NUM_LAYERS];  // K cache per layer
+    id<MTLBuffer> buf_kv_v[NUM_LAYERS];  // V cache per layer
     id<MTLBuffer> buf_attn_q;       // [NUM_ATTN_HEADS * HEAD_DIM floats] all query heads
     id<MTLBuffer> buf_attn_scores;  // [NUM_ATTN_HEADS * MAX_SEQ_LEN floats] all heads' scores
     id<MTLBuffer> buf_attn_out;     // [NUM_ATTN_HEADS * HEAD_DIM floats] full attention output
-    id<MTLBuffer> buf_attn_gate;    // [NUM_ATTN_HEADS * HEAD_DIM floats] sigmoid gate
     // CMD3 GPU-side combine buffers (weighted_sum + residual + norm on GPU)
     id<MTLComputePipelineState> moe_combine_residual;  // fused combine kernel
     id<MTLBuffer> buf_moe_hidden;     // [HIDDEN_DIM floats] GPU combine output (hidden state)
@@ -968,25 +928,6 @@ typedef struct {
     // Shared event for CPU-GPU synchronization (async pipeline)
     id<MTLSharedEvent> pipeline_event;   // CPU signals when buf_input is ready
     uint64_t event_value;                // monotonically increasing event counter
-    // GPU delta-net (gated_delta_net_step) and conv1d pipelines
-    id<MTLComputePipelineState> delta_net_step;  // gated_delta_net_step kernel
-    id<MTLComputePipelineState> conv1d_step;     // conv1d_step kernel
-    id<MTLComputePipelineState> rms_norm_qk;     // per-head RMS normalize for q and k
-    id<MTLComputePipelineState> compute_decay_beta; // g_decay and beta_gate for delta-net
-    id<MTLComputePipelineState> gated_rms_norm;  // z-gated output normalization
-    // Persistent GPU state buffers for linear attention layers
-    #define NUM_LINEAR_LAYERS 45
-    id<MTLBuffer> buf_delta_state[NUM_LINEAR_LAYERS];   // [64*128*128] float per layer
-    id<MTLBuffer> buf_conv_state[NUM_LINEAR_LAYERS];     // [3*12288] float per layer
-    // Scratch buffers for delta-net inputs/outputs
-    id<MTLBuffer> buf_delta_q;        // [2048] float
-    id<MTLBuffer> buf_delta_k;        // [2048] float
-    id<MTLBuffer> buf_delta_v;        // [8192] float
-    id<MTLBuffer> buf_delta_g_decay;  // [64] float
-    id<MTLBuffer> buf_delta_beta;     // [64] float
-    id<MTLBuffer> buf_delta_output;   // [8192] float
-    id<MTLBuffer> buf_conv_input;     // [12288] float
-    id<MTLBuffer> buf_conv_output;    // [12288] float
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -1053,19 +994,8 @@ static MetalCtx *metal_setup(void) {
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
-    ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
-    ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
-    ctx->conv1d_step       = makePipe(@"conv1d_step");
-    ctx->rms_norm_qk       = makePipe(@"rms_norm_qk");
-    ctx->compute_decay_beta = makePipe(@"compute_decay_beta");
-    ctx->gated_rms_norm    = makePipe(@"gated_rms_norm");
     if (!ctx->moe_combine_residual) fprintf(stderr, "[metal] WARNING: moe_combine_residual pipeline failed\n");
-    if (!ctx->delta_net_step) fprintf(stderr, "[metal] WARNING: gated_delta_net_step pipeline failed (CPU fallback)\n");
-    if (!ctx->conv1d_step)    fprintf(stderr, "[metal] WARNING: conv1d_step pipeline failed (CPU fallback)\n");
-    if (!ctx->rms_norm_qk)       fprintf(stderr, "[metal] WARNING: rms_norm_qk pipeline failed (CPU fallback)\n");
-    if (!ctx->compute_decay_beta) fprintf(stderr, "[metal] WARNING: compute_decay_beta pipeline failed (CPU fallback)\n");
-    if (!ctx->gated_rms_norm)     fprintf(stderr, "[metal] WARNING: gated_rms_norm pipeline failed (CPU fallback)\n");
 
     if (!ctx->matvec_v3 || !ctx->matvec_fast) {
         fprintf(stderr, "ERROR: Required Metal pipeline missing\n");
@@ -1073,23 +1003,18 @@ static MetalCtx *metal_setup(void) {
     }
 
     // Allocate reusable buffers (large enough for biggest projection)
-    // Q proj output is 16384 floats, lm_head output is 248320 floats
-    // o_proj input is 8192, linear attn out_proj input is 8192
+    // Q proj output is NUM_ATTN_HEADS*HEAD_DIM = 8192 floats, lm_head output is 151936 floats
+    // o_proj input is NUM_ATTN_HEADS*HEAD_DIM = 8192
     size_t max_out = VOCAB_SIZE * sizeof(float);  // lm_head is largest
-    size_t max_in = LINEAR_TOTAL_VALUE * sizeof(float);  // 8192 floats (linear_attn out_proj)
-    if (max_in < (size_t)(NUM_ATTN_HEADS * HEAD_DIM) * sizeof(float)) {
-        max_in = (size_t)(NUM_ATTN_HEADS * HEAD_DIM) * sizeof(float);  // o_proj input = 8192
-    }
+    size_t max_in = (size_t)(NUM_ATTN_HEADS * HEAD_DIM) * sizeof(float);  // o_proj input = 8192
     ctx->buf_input  = [ctx->device newBufferWithLength:max_in  options:MTLResourceStorageModeShared];
     ctx->buf_output = [ctx->device newBufferWithLength:max_out options:MTLResourceStorageModeShared];
 
     // Batched matmul output slots — each large enough for the biggest projection
-    // q_proj = 16384 floats, qkv_proj = 12288, z_proj = 8192, o_proj = 4096
-    // lm_head (248320) uses buf_output directly, not batched.
+    // q_proj = NUM_ATTN_HEADS*HEAD_DIM = 8192 floats, k/v_proj = NUM_KV_HEADS*HEAD_DIM = 512 floats
+    // lm_head (151936) uses buf_output directly, not batched.
     {
-        size_t slot_size = (size_t)(NUM_ATTN_HEADS * HEAD_DIM * 2) * sizeof(float);  // 16384 floats
-        if (slot_size < (size_t)LINEAR_CONV_DIM * sizeof(float))
-            slot_size = (size_t)LINEAR_CONV_DIM * sizeof(float);  // 12288 floats
+        size_t slot_size = (size_t)(NUM_ATTN_HEADS * HEAD_DIM) * sizeof(float);  // 8192 floats
         for (int i = 0; i < MAX_BATCH_SLOTS; i++) {
             ctx->batch_out[i] = [ctx->device newBufferWithLength:slot_size
                                                          options:MTLResourceStorageModeShared];
@@ -1141,16 +1066,6 @@ static MetalCtx *metal_setup(void) {
                                                                  options:MTLResourceStorageModeShared];
     }
 
-    // Shared expert buffers (for fused CMD2)
-    ctx->buf_shared_gate = [ctx->device newBufferWithLength:SHARED_INTERMEDIATE * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
-    ctx->buf_shared_up   = [ctx->device newBufferWithLength:SHARED_INTERMEDIATE * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
-    ctx->buf_shared_act  = [ctx->device newBufferWithLength:SHARED_INTERMEDIATE * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
-    ctx->buf_shared_out  = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
-
     // Fused o_proj+norm+routing buffers
     ctx->buf_residual = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
                                                  options:MTLResourceStorageModeShared];
@@ -1167,11 +1082,11 @@ static MetalCtx *metal_setup(void) {
     ctx->buf_cmd3_sum_sq    = [ctx->device newBufferWithLength:sizeof(float)
                                                         options:MTLResourceStorageModeShared];
 
-    // GPU attention buffers
+    // GPU attention buffers (all 94 layers are standard GQA attention)
     {
-        size_t kv_dim = NUM_KV_HEADS * HEAD_DIM;  // 512
+        size_t kv_dim = NUM_KV_HEADS * HEAD_DIM;  // 4 * 128 = 512
         size_t kv_cache_size = GPU_KV_SEQ * kv_dim * sizeof(float);
-        for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
+        for (int i = 0; i < NUM_LAYERS; i++) {
             ctx->buf_kv_k[i] = [ctx->device newBufferWithLength:kv_cache_size
                                                         options:MTLResourceStorageModeShared];
             ctx->buf_kv_v[i] = [ctx->device newBufferWithLength:kv_cache_size
@@ -1183,36 +1098,9 @@ static MetalCtx *metal_setup(void) {
                                                         options:MTLResourceStorageModeShared];
         ctx->buf_attn_out    = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
                                                         options:MTLResourceStorageModeShared];
-        ctx->buf_attn_gate   = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
-                                                        options:MTLResourceStorageModeShared];
         printf("[metal] GPU attention buffers: %d KV caches (%.1f MB each), scores buf %.1f MB\n",
-               NUM_FULL_ATTN_LAYERS, kv_cache_size / 1e6,
-               (double)(NUM_ATTN_HEADS * MAX_SEQ_LEN * sizeof(float)) / 1e6);
-    }
-
-    // Persistent GPU state buffers for delta-net (linear attention layers)
-    if (ctx->delta_net_step) {
-        for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
-            ctx->buf_delta_state[i] = [ctx->device newBufferWithLength:64*128*128*sizeof(float)
-                                                               options:MTLResourceStorageModeShared];
-            memset([ctx->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
-            ctx->buf_conv_state[i] = [ctx->device newBufferWithLength:3*12288*sizeof(float)
-                                                              options:MTLResourceStorageModeShared];
-            memset([ctx->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
-        }
-        // Scratch buffers for delta-net inputs/outputs (allocated once, reused)
-        ctx->buf_delta_q       = [ctx->device newBufferWithLength:2048*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_k       = [ctx->device newBufferWithLength:2048*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_v       = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_delta_g_decay = [ctx->device newBufferWithLength:64*sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_delta_beta    = [ctx->device newBufferWithLength:64*sizeof(float)    options:MTLResourceStorageModeShared];
-        ctx->buf_delta_output  = [ctx->device newBufferWithLength:8192*sizeof(float)  options:MTLResourceStorageModeShared];
-        ctx->buf_conv_input    = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
-        ctx->buf_conv_output   = [ctx->device newBufferWithLength:12288*sizeof(float) options:MTLResourceStorageModeShared];
-        printf("[metal] Delta-net GPU buffers: %d layers (%.1f MB state + %.1f MB scratch)\n",
-               NUM_LINEAR_LAYERS,
-               NUM_LINEAR_LAYERS * (64*128*128*4 + 3*12288*4) / 1e6,
-               (2048+2048+8192+64+64+8192+12288+12288) * 4 / 1e6);
+               NUM_LAYERS, kv_cache_size / 1e6,
+               (double)(NUM_ATTN_HEADS * GPU_KV_SEQ * sizeof(float)) / 1e6);
     }
 
     // Create shared event for CPU-GPU async pipeline
@@ -1223,16 +1111,7 @@ static MetalCtx *metal_setup(void) {
     return ctx;
 }
 
-// Reset delta-net and conv GPU state buffers (call at start of new generation)
-static void reset_delta_net_state(void) {
-    if (!g_metal || !g_metal->delta_net_step) return;
-    for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
-        if (g_metal->buf_delta_state[i])
-            memset([g_metal->buf_delta_state[i] contents], 0, 64*128*128*sizeof(float));
-        if (g_metal->buf_conv_state[i])
-            memset([g_metal->buf_conv_state[i] contents], 0, 3*12288*sizeof(float));
-    }
-}
+// (reset_delta_net_state removed — Qwen3-235B has no linear attention state)
 
 // Wrap the mmap'd weight file as a Metal buffer (zero-copy on unified memory)
 // mmap returns page-aligned addresses, Metal requires the same.
@@ -1512,9 +1391,9 @@ static void gpu_encode_expert_forward_slot(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = 0;         gate_s_off = 3145728;  gate_b_off = 3342336;
+        up_w_off   = 3538944;  up_s_off   = 6684672;  up_b_off   = 6881280;
+        down_w_off = 7077888;  down_s_off = 10223616; down_b_off = 10420224;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1608,9 +1487,9 @@ static void gpu_encode_expert_forward_slot_buf(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = 0;         gate_s_off = 3145728;  gate_b_off = 3342336;
+        up_w_off   = 3538944;  up_s_off   = 6684672;  up_b_off   = 6881280;
+        down_w_off = 7077888;  down_s_off = 10223616; down_b_off = 10420224;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1708,9 +1587,9 @@ static void gpu_encode_experts_batched(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = 0;         gate_s_off = 3145728;  gate_b_off = 3342336;
+        up_w_off   = 3538944;  up_s_off   = 6684672;  up_b_off   = 6881280;
+        down_w_off = 7077888;  down_s_off = 10223616; down_b_off = 10420224;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -1794,14 +1673,14 @@ static void gpu_encode_expert_forward(
     id<MTLCommandBuffer> cmdbuf
 ) {
     NSUInteger gate_w_off = 0;
-    NSUInteger gate_s_off = 2097152;
-    NSUInteger gate_b_off = 2228224;
-    NSUInteger up_w_off   = 2359296;
-    NSUInteger up_s_off   = 4456448;
-    NSUInteger up_b_off   = 4587520;
-    NSUInteger down_w_off = 4718592;
-    NSUInteger down_s_off = 6815744;
-    NSUInteger down_b_off = 6946816;
+    NSUInteger gate_s_off = 3145728;
+    NSUInteger gate_b_off = 3342336;
+    NSUInteger up_w_off   = 3538944;
+    NSUInteger up_s_off   = 6684672;
+    NSUInteger up_b_off   = 6881280;
+    NSUInteger down_w_off = 7077888;
+    NSUInteger down_s_off = 10223616;
+    NSUInteger down_b_off = 10420224;
 
     uint32_t gate_up_out = MOE_INTERMEDIATE;
     uint32_t gate_up_in  = HIDDEN_DIM;
@@ -1917,9 +1796,9 @@ static void gpu_expert_forward(
         up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
         down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
     } else {
-        gate_w_off = 0;        gate_s_off = 2097152;  gate_b_off = 2228224;
-        up_w_off   = 2359296;  up_s_off   = 4456448;  up_b_off   = 4587520;
-        down_w_off = 4718592;  down_s_off = 6815744;  down_b_off = 6946816;
+        gate_w_off = 0;         gate_s_off = 3145728;  gate_b_off = 3342336;
+        up_w_off   = 3538944;  up_s_off   = 6684672;  up_b_off   = 6881280;
+        down_w_off = 7077888;  down_s_off = 10223616; down_b_off = 10420224;
     }
     id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
 
@@ -2084,29 +1963,7 @@ static void kv_cache_free(KVCache *c) {
     }
 }
 
-// ============================================================================
-// Linear attention state (GatedDeltaNet recurrent state)
-// ============================================================================
-
-typedef struct {
-    float *conv_state;  // [(kernel_size-1) * conv_dim] for conv1d
-    float *ssm_state;   // [num_v_heads, head_v_dim, head_k_dim] recurrent state
-} LinearAttnState;
-
-static LinearAttnState *linear_attn_state_new(void) {
-    LinearAttnState *s = calloc(1, sizeof(LinearAttnState));
-    s->conv_state = calloc((CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM, sizeof(float));
-    s->ssm_state = calloc(LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM, sizeof(float));
-    return s;
-}
-
-static void linear_attn_state_free(LinearAttnState *s) {
-    if (s) {
-        free(s->conv_state);
-        free(s->ssm_state);
-        free(s);
-    }
-}
+// (LinearAttnState removed — Qwen3-235B uses standard GQA attention only)
 
 // ============================================================================
 // Full attention layer forward (single token, incremental)
@@ -2153,13 +2010,11 @@ static void full_attention_forward(
     }
 
     // ---- QKV Projection ----
-    // CRITICAL: Q projection outputs num_heads * head_dim * 2 = 16384
-    // The second half is a sigmoid gate applied after attention
-    int q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;  // 32 * 256 * 2 = 16384
-    int q_dim = NUM_ATTN_HEADS * HEAD_DIM;            // 32 * 256 = 8192
-    int kv_dim = NUM_KV_HEADS * HEAD_DIM;             // 2 * 256 = 512
+    // Qwen3: Q projection outputs num_heads * head_dim = 8192 (no sigmoid gate)
+    int q_dim = NUM_ATTN_HEADS * HEAD_DIM;            // 64 * 128 = 8192
+    int kv_dim = NUM_KV_HEADS * HEAD_DIM;             // 4 * 128 = 512
 
-    float *q_proj_out = calloc(q_proj_dim, sizeof(float));
+    float *q = calloc(q_dim, sizeof(float));
     float *k = calloc(kv_dim, sizeof(float));
     float *v = calloc(kv_dim, sizeof(float));
 
@@ -2188,7 +2043,7 @@ static void full_attention_forward(
     // Batch Q/K/V into one command buffer (3 dispatches, 1 commit)
     if (qw && qs && qb && kw && ks && kb && vw && vs && vb) {
         BatchMatvecSpec qkv_specs[3] = {
-            { qw, qs, qb, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0 },
+            { qw, qs, qb, q,          (uint32_t)q_dim,      HIDDEN_DIM, GROUP_SIZE, 0 },
             { kw, ks, kb, k,          (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1 },
             { vw, vs, vb, v,          (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2 },
         };
@@ -2196,30 +2051,8 @@ static void full_attention_forward(
     }
 
     if (do_debug) {
-        fprintf(stderr, "[FA-DBG] q_proj first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                q_proj_out[0], q_proj_out[1], q_proj_out[2], q_proj_out[3], q_proj_out[4]);
-    }
-
-    // Split q_proj_out into queries and gate
-    float *q = calloc(q_dim, sizeof(float));
-    float *q_gate = calloc(q_dim, sizeof(float));
-    for (int h = 0; h < NUM_ATTN_HEADS; h++) {
-        float *src = q_proj_out + h * (2 * HEAD_DIM);
-        memcpy(q + h * HEAD_DIM, src, HEAD_DIM * sizeof(float));
-        memcpy(q_gate + h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
-    }
-    free(q_proj_out);
-
-    if (do_debug) {
-        fprintf(stderr, "[FA-DBG] v_rms=%.6f first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                vec_rms(v, kv_dim), v[0], v[1], v[2], v[3], v[4]);
-        fprintf(stderr, "[FA-DBG] q_gate_rms=%.6f gate_first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
-                vec_rms(q_gate, q_dim), q_gate[0], q_gate[1], q_gate[2], q_gate[3], q_gate[4]);
-        float gate_sigmoid_sum = 0.0f;
-        for (int i = 0; i < q_dim; i++) {
-            gate_sigmoid_sum += 1.0f / (1.0f + expf(-q_gate[i]));
-        }
-        fprintf(stderr, "[FA-DBG] gate_sigmoid_mean=%.6f\n", gate_sigmoid_sum / q_dim);
+        fprintf(stderr, "[FA-DBG] q first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+                q[0], q[1], q[2], q[3], q[4]);
     }
 
     // ---- Q/K RMSNorm ----
@@ -2301,15 +2134,8 @@ static void full_attention_forward(
     }
 
 
-    // ---- Apply sigmoid gate to attention output ----
-    // MLX: return self.o_proj(output * mx.sigmoid(gate))
-    // gate is reshaped to [B, L, num_heads*head_dim] = flat [q_dim]
-    for (int i = 0; i < q_dim; i++) {
-        float g = 1.0f / (1.0f + expf(-q_gate[i]));
-        attn_out[i] *= g;
-    }
-
     // ---- Output projection ----
+    // Qwen3: no sigmoid gate on attention output
     float *attn_projected = calloc(HIDDEN_DIM, sizeof(float));
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer_idx);
     uint32_t *ow = get_tensor_ptr(wf, name);
@@ -2339,47 +2165,22 @@ static void full_attention_forward(
     free(normed);
     free(residual);
     free(q);
-    free(q_gate);
     free(k);
     free(v);
     free(attn_out);
     free(attn_projected);
 }
 
-// ============================================================================
-// Linear attention layer forward (GatedDeltaNet, single token, incremental)
-// ============================================================================
+// (Linear attention subsystem removed — Qwen3-235B uses standard GQA attention only)
 
-// RMS norm without weights (just normalize)
-static void cpu_rms_norm_bare(const float *x, float *out, int dim, float eps) {
-    float sum_sq = 0.0f;
-    for (int i = 0; i < dim; i++) sum_sq += x[i] * x[i];
-    float inv_rms = 1.0f / sqrtf(sum_sq / dim + eps);
-    for (int i = 0; i < dim; i++) out[i] = x[i] * inv_rms;
-}
-
-// RMSNormGated: out = rms_norm(x) * silu(z)
-static void cpu_rms_norm_gated(const float *x, const float *z, const uint16_t *w_bf16,
-                                float *out, int dim, float eps) {
-    float sum_sq = 0.0f;
-    for (int i = 0; i < dim; i++) sum_sq += x[i] * x[i];
-    float inv_rms = 1.0f / sqrtf(sum_sq / dim + eps);
-    for (int i = 0; i < dim; i++) {
-        float w = bf16_to_f32(w_bf16[i]);
-        float silu_z = z[i] / (1.0f + expf(-z[i]));
-        out[i] = x[i] * inv_rms * w * silu_z;
-    }
-}
-
-static int linear_attn_bypass = 0;  // set to 1 to skip linear attention (identity)
-static int gpu_linear_attn_enabled = 1;  // fused GPU delta-net path (can disable via --cpu-linear)
-
+// linear_attention_forward removed — Qwen3-235B has no linear attention layers
+#if 0  // Dead code: linear_attention_forward (was for Qwen3.5-397B GatedDeltaNet)
 __attribute__((unused))
-static void linear_attention_forward(
+static void linear_attention_forward_REMOVED(
     WeightFile *wf,
     int layer_idx,
-    float *hidden,           // [HIDDEN_DIM] in/out
-    LinearAttnState *state
+    float *hidden,
+    void *state
 ) {
     // If bypass is enabled, just pass through (identity)
     if (linear_attn_bypass) {
@@ -2631,11 +2432,12 @@ static void linear_attention_forward(
     free(gated_out);
     free(attn_out);
 }
+#endif  // Dead code: linear_attention_forward
 
 // ============================================================================
-// MoE forward (routing + expert computation + shared expert)
+// MoE forward — DEAD CODE (was for Qwen3.5-397B with shared experts)
 // ============================================================================
-
+#if 0  // Dead code: moe_forward (Qwen3.5 shared expert path)
 static int moe_debug_count = 0;
 
 __attribute__((unused))
@@ -2756,14 +2558,14 @@ static void moe_forward(
                 }
 
                 uint32_t *gw = (uint32_t *)expert_data;
-                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
+                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 3145728));
+                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 3342336));
+                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 3538944));
+                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 6684672));
+                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 6881280));
+                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 7077888));
+                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 10223616));
+                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 10420224));
 
                 float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
                 float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
@@ -2855,6 +2657,7 @@ static void moe_forward(
     free(shared_up);
     free(shared_act);
 }
+#endif  // Dead code: moe_forward
 
 // ============================================================================
 // Embedding lookup (4-bit quantized)
@@ -3651,30 +3454,15 @@ typedef struct {
     uint16_t *input_norm_w;
     uint16_t *post_attn_norm_w;
 
-    // Full attention weights (non-NULL only for full attention layers)
+    // Standard GQA attention weights (all layers)
     uint32_t *q_w; uint16_t *q_s, *q_b;
     uint32_t *k_w; uint16_t *k_s, *k_b;
     uint32_t *v_w; uint16_t *v_s, *v_b;
     uint32_t *o_w; uint16_t *o_s, *o_b;
     uint16_t *q_norm_w, *k_norm_w;
 
-    // Linear attention weights (non-NULL only for linear attention layers)
-    uint32_t *qkv_w; uint16_t *qkv_s, *qkv_b;
-    uint32_t *z_w;   uint16_t *z_s, *z_b;
-    uint32_t *b_w;   uint16_t *b_s, *b_b;
-    uint32_t *a_w;   uint16_t *a_s, *a_b;
-    uint16_t *conv1d_w;
-    float *A_log;
-    uint16_t *dt_bias;
-    uint16_t *gated_norm_w;
-    uint32_t *out_proj_w; uint16_t *out_proj_s, *out_proj_b;
-
-    // MoE routing + shared expert weights
+    // MoE routing weights (no shared expert in Qwen3-235B)
     uint32_t *gate_w; uint16_t *gate_s, *gate_b;
-    uint32_t *sg_w;   uint16_t *sg_s, *sg_b;   // shared gate_proj
-    uint32_t *su_w;   uint16_t *su_s, *su_b;   // shared up_proj
-    uint32_t *sd_w;   uint16_t *sd_s, *sd_b;   // shared down_proj
-    uint32_t *seg_w;  uint16_t *seg_s, *seg_b; // shared_expert_gate
 } LayerWeightCache;
 
 static LayerWeightCache layer_cache[NUM_LAYERS];
@@ -3686,7 +3474,6 @@ static void build_layer_cache(WeightFile *wf) {
 
     for (int i = 0; i < NUM_LAYERS; i++) {
         LayerWeightCache *lc = &layer_cache[i];
-        int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
 
         // Norms
         snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", i);
@@ -3694,109 +3481,43 @@ static void build_layer_cache(WeightFile *wf) {
         snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", i);
         lc->post_attn_norm_w = get_tensor_ptr(wf, name);
 
-        if (is_full) {
-            // Full attention
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", i);
-            lc->q_w = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.scales", i);
-            lc->q_s = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.biases", i);
-            lc->q_b = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", i);
-            lc->k_w = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.scales", i);
-            lc->k_s = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.biases", i);
-            lc->k_b = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", i);
-            lc->v_w = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.scales", i);
-            lc->v_s = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.biases", i);
-            lc->v_b = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", i);
-            lc->o_w = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.scales", i);
-            lc->o_s = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", i);
-            lc->o_b = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", i);
-            lc->q_norm_w = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", i);
-            lc->k_norm_w = get_tensor_ptr(wf, name);
-        } else {
-            // Linear attention
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", i);
-            lc->qkv_w = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.scales", i);
-            lc->qkv_s = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.biases", i);
-            lc->qkv_b = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.weight", i);
-            lc->z_w = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.scales", i);
-            lc->z_s = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.biases", i);
-            lc->z_b = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.weight", i);
-            lc->b_w = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.scales", i);
-            lc->b_s = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_b.biases", i);
-            lc->b_b = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.weight", i);
-            lc->a_w = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.scales", i);
-            lc->a_s = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.biases", i);
-            lc->a_b = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", i);
-            lc->conv1d_w = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.A_log", i);
-            lc->A_log = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.dt_bias", i);
-            lc->dt_bias = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.norm.weight", i);
-            lc->gated_norm_w = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", i);
-            lc->out_proj_w = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.scales", i);
-            lc->out_proj_s = get_tensor_ptr(wf, name);
-            snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.biases", i);
-            lc->out_proj_b = get_tensor_ptr(wf, name);
-        }
+        // Standard GQA attention (all layers)
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", i);
+        lc->q_w = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.scales", i);
+        lc->q_s = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.biases", i);
+        lc->q_b = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", i);
+        lc->k_w = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.scales", i);
+        lc->k_s = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.biases", i);
+        lc->k_b = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", i);
+        lc->v_w = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.scales", i);
+        lc->v_s = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.biases", i);
+        lc->v_b = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", i);
+        lc->o_w = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.scales", i);
+        lc->o_s = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", i);
+        lc->o_b = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_norm.weight", i);
+        lc->q_norm_w = get_tensor_ptr(wf, name);
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_norm.weight", i);
+        lc->k_norm_w = get_tensor_ptr(wf, name);
 
-        // MoE weights (same for all layers)
+        // MoE routing weights (no shared expert in Qwen3-235B)
         snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", i);
         lc->gate_w = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.scales", i);
         lc->gate_s = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.biases", i);
         lc->gate_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", i);
-        lc->sg_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", i);
-        lc->sg_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", i);
-        lc->sg_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", i);
-        lc->su_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", i);
-        lc->su_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", i);
-        lc->su_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", i);
-        lc->sd_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", i);
-        lc->sd_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", i);
-        lc->sd_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", i);
-        lc->seg_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", i);
-        lc->seg_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", i);
-        lc->seg_b = get_tensor_ptr(wf, name);
     }
 
     layer_cache_built = 1;
@@ -3848,7 +3569,7 @@ static void finalize_deferred_experts(void) {
         memcpy(g_deferred.hidden, [g_metal->buf_moe_hidden contents],
                HIDDEN_DIM * sizeof(float));
     } else {
-        // CPU-side combine (original path)
+        // CPU-side combine (original path, no shared expert in Qwen3)
         // Read back and accumulate routed expert outputs
         float moe_out[HIDDEN_DIM];
         memset(moe_out, 0, sizeof(moe_out));
@@ -3858,19 +3579,9 @@ static void finalize_deferred_experts(void) {
             cpu_vec_madd(moe_out, expert_result, g_deferred.expert_weights[k], HIDDEN_DIM);
         }
 
-        // Read shared expert result
-        float shared_out[HIDDEN_DIM];
-        memcpy(shared_out, [g_metal->buf_shared_out contents], HIDDEN_DIM * sizeof(float));
-
-        // Apply shared expert gate
-        float shared_weight = cpu_sigmoid(g_deferred.shared_gate_score);
+        // Final combine: hidden = h_mid + moe_out
         for (int i = 0; i < HIDDEN_DIM; i++) {
-            shared_out[i] *= shared_weight;
-        }
-
-        // Final combine: hidden = h_mid + moe_out + shared_out
-        for (int i = 0; i < HIDDEN_DIM; i++) {
-            g_deferred.hidden[i] = g_deferred.h_mid[i] + moe_out[i] + shared_out[i];
+            g_deferred.hidden[i] = g_deferred.h_mid[i] + moe_out[i];
         }
     }
 
@@ -3936,8 +3647,7 @@ static void discard_deferred_experts(void) {
 //   4. GPU-side combine in CMD3 (eliminates CPU deferred_wait + combine + norm)
 // ============================================================================
 
-// Static scratch buffers — allocated once, reused across all 60 layers per token.
-// Eliminates ~20 malloc/free per layer = ~1200 alloc/free per token.
+// Static scratch buffers — allocated once, reused across all 94 layers per token.
 static float *s_normed    = NULL;   // [HIDDEN_DIM]
 static float *s_residual  = NULL;   // [HIDDEN_DIM]
 static float *s_attn_proj = NULL;   // [HIDDEN_DIM]
@@ -3947,25 +3657,13 @@ static float *s_gate_scores = NULL; // [NUM_EXPERTS]
 static float *s_spec_gate_scores = NULL; // [NUM_EXPERTS] speculative routing scratch
 static int s_spec_indices[MAX_K];         // speculative routing predicted expert indices
 static int s_spec_count = 0;              // number of speculative predictions this layer
-static float *s_shared_gate = NULL; // [SHARED_INTERMEDIATE]
-static float *s_shared_up  = NULL;  // [SHARED_INTERMEDIATE]
 static float *s_moe_out   = NULL;   // [HIDDEN_DIM]
-static float *s_shared_out = NULL;  // [HIDDEN_DIM]
-// Full attention scratch
-static float *s_q_proj_out = NULL;  // [NUM_ATTN_HEADS * HEAD_DIM * 2]
+// Attention scratch (all layers are standard GQA)
+static float *s_q_proj_out = NULL;  // [NUM_ATTN_HEADS * HEAD_DIM]
 static float *s_k_proj_out = NULL;  // [NUM_KV_HEADS * HEAD_DIM]
 static float *s_v_proj_out = NULL;  // [NUM_KV_HEADS * HEAD_DIM]
 static float *s_q         = NULL;   // [NUM_ATTN_HEADS * HEAD_DIM]
-static float *s_q_gate    = NULL;   // [NUM_ATTN_HEADS * HEAD_DIM]
 static float *s_attn_out  = NULL;   // [NUM_ATTN_HEADS * HEAD_DIM]
-// Linear attention scratch
-static float *s_qkv_proj_out = NULL;   // [LINEAR_CONV_DIM]
-static float *s_z_proj_out   = NULL;   // [LINEAR_TOTAL_VALUE]
-static float *s_beta_proj_out = NULL;  // [LINEAR_NUM_V_HEADS]
-static float *s_alpha_proj_out = NULL; // [LINEAR_NUM_V_HEADS]
-static float *s_conv_out  = NULL;   // [LINEAR_CONV_DIM]
-static float *s_out_vals  = NULL;   // [LINEAR_TOTAL_VALUE]
-static float *s_gated_out = NULL;   // [LINEAR_TOTAL_VALUE]
 
 static void init_layer_scratch(void) {
     if (s_normed) return;  // already initialized
@@ -3976,36 +3674,26 @@ static void init_layer_scratch(void) {
     s_h_mid      = calloc(HIDDEN_DIM, sizeof(float));
     s_gate_scores = calloc(NUM_EXPERTS, sizeof(float));
     s_spec_gate_scores = calloc(NUM_EXPERTS, sizeof(float));
-    s_shared_gate = calloc(SHARED_INTERMEDIATE, sizeof(float));
-    s_shared_up  = calloc(SHARED_INTERMEDIATE, sizeof(float));
     s_moe_out    = calloc(HIDDEN_DIM, sizeof(float));
-    s_shared_out = calloc(HIDDEN_DIM, sizeof(float));
-    s_q_proj_out = calloc(NUM_ATTN_HEADS * HEAD_DIM * 2, sizeof(float));
+    s_q_proj_out = calloc(NUM_ATTN_HEADS * HEAD_DIM, sizeof(float));
     s_k_proj_out = calloc(NUM_KV_HEADS * HEAD_DIM, sizeof(float));
     s_v_proj_out = calloc(NUM_KV_HEADS * HEAD_DIM, sizeof(float));
     s_q          = calloc(NUM_ATTN_HEADS * HEAD_DIM, sizeof(float));
-    s_q_gate     = calloc(NUM_ATTN_HEADS * HEAD_DIM, sizeof(float));
     s_attn_out   = calloc(NUM_ATTN_HEADS * HEAD_DIM, sizeof(float));
-    s_qkv_proj_out = calloc(LINEAR_CONV_DIM, sizeof(float));
-    s_z_proj_out   = calloc(LINEAR_TOTAL_VALUE, sizeof(float));
-    s_beta_proj_out = calloc(LINEAR_NUM_V_HEADS, sizeof(float));
-    s_alpha_proj_out = calloc(LINEAR_NUM_V_HEADS, sizeof(float));
-    s_conv_out   = calloc(LINEAR_CONV_DIM, sizeof(float));
-    s_out_vals   = calloc(LINEAR_TOTAL_VALUE, sizeof(float));
-    s_gated_out  = calloc(LINEAR_TOTAL_VALUE, sizeof(float));
 }
 
 static void fused_layer_forward(
     WeightFile *wf,
     int layer_idx,
     float *hidden,           // [HIDDEN_DIM] in/out
-    KVCache *kv,             // non-NULL for full attention layers
-    LinearAttnState *la_state, // non-NULL for linear attention layers
+    KVCache *kv,             // KV cache for this layer (all layers use standard GQA)
+    void *la_state_unused,   // unused — kept for call-site compatibility (always NULL)
     int pos,                 // position for RoPE
     const void *mmap_base,   // mmap'd layer file (NULL if not available)
     int K,                   // number of active experts
     int packed_fd            // fd for packed expert file
 ) {
+    (void)la_state_unused;  // Qwen3 has no linear attention
     double t_layer_start = 0, t0 = 0, t1 = 0;
     if (g_timing_enabled) { t_layer_start = now_ms(); }
     int pred_started = 0;  // set to 1 if we started prediction preads during CMD1_wait
@@ -4013,7 +3701,7 @@ static void fused_layer_forward(
     init_layer_scratch();
     if (!layer_cache_built) build_layer_cache(wf);
     LayerWeightCache *lc = &layer_cache[layer_idx];
-    int is_full = (kv != NULL);
+    int is_full = 1;  // All layers are standard GQA in Qwen3-235B
 
     // =====================================================================
     // PHASE 1: Deferred completion + CMD1 (attention projections)
@@ -4023,11 +3711,10 @@ static void fused_layer_forward(
     int num_attn_specs = 0;
     BatchMatvecSpec attn_specs[5];
     float *q_proj_out = NULL, *k_out = NULL, *v_out = NULL;
-    float *qkv_out = NULL, *z_out = NULL, *beta_out = NULL, *alpha_out = NULL;
 
-    if (is_full) {
-        int q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;
-        int kv_dim = NUM_KV_HEADS * HEAD_DIM;
+    {
+        int q_dim = NUM_ATTN_HEADS * HEAD_DIM;  // 64*128 = 8192
+        int kv_dim = NUM_KV_HEADS * HEAD_DIM;   // 4*128 = 512
 
         q_proj_out = s_q_proj_out;
         k_out = s_k_proj_out;
@@ -4035,27 +3722,10 @@ static void fused_layer_forward(
 
         if (lc->q_w && lc->q_s && lc->q_b && lc->k_w && lc->k_s && lc->k_b &&
             lc->v_w && lc->v_s && lc->v_b) {
-            attn_specs[0] = (BatchMatvecSpec){ lc->q_w, lc->q_s, lc->q_b, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0 };
-            attn_specs[1] = (BatchMatvecSpec){ lc->k_w, lc->k_s, lc->k_b, k_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1 };
-            attn_specs[2] = (BatchMatvecSpec){ lc->v_w, lc->v_s, lc->v_b, v_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2 };
+            attn_specs[0] = (BatchMatvecSpec){ lc->q_w, lc->q_s, lc->q_b, q_proj_out, (uint32_t)q_dim,  HIDDEN_DIM, GROUP_SIZE, 0 };
+            attn_specs[1] = (BatchMatvecSpec){ lc->k_w, lc->k_s, lc->k_b, k_out,      (uint32_t)kv_dim, HIDDEN_DIM, GROUP_SIZE, 1 };
+            attn_specs[2] = (BatchMatvecSpec){ lc->v_w, lc->v_s, lc->v_b, v_out,      (uint32_t)kv_dim, HIDDEN_DIM, GROUP_SIZE, 2 };
             num_attn_specs = 3;
-        }
-    } else {
-        int qkv_dim = LINEAR_CONV_DIM;
-        int z_dim = LINEAR_TOTAL_VALUE;
-
-        qkv_out = s_qkv_proj_out;
-        z_out = s_z_proj_out;
-        beta_out = s_beta_proj_out;
-        alpha_out = s_alpha_proj_out;
-
-        if (lc->qkv_w && lc->qkv_s && lc->qkv_b && lc->z_w && lc->z_s && lc->z_b &&
-            lc->b_w && lc->b_s && lc->b_b && lc->a_w && lc->a_s && lc->a_b) {
-            attn_specs[0] = (BatchMatvecSpec){ lc->qkv_w, lc->qkv_s, lc->qkv_b, qkv_out,   (uint32_t)qkv_dim,            HIDDEN_DIM, GROUP_SIZE, 0 };
-            attn_specs[1] = (BatchMatvecSpec){ lc->z_w,   lc->z_s,   lc->z_b,   z_out,      (uint32_t)z_dim,              HIDDEN_DIM, GROUP_SIZE, 1 };
-            attn_specs[2] = (BatchMatvecSpec){ lc->b_w,   lc->b_s,   lc->b_b,   beta_out,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2 };
-            attn_specs[3] = (BatchMatvecSpec){ lc->a_w,   lc->a_s,   lc->a_b,   alpha_out,  (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3 };
-            num_attn_specs = 4;
         }
     }
 
@@ -4063,22 +3733,6 @@ static void fused_layer_forward(
     float *normed = s_normed;
     float *residual = s_residual;
     id<MTLCommandBuffer> cmd1 = nil;
-    int gpu_linear_attn = 0;  // set to 1 if GPU handles entire linear attention pipeline
-
-    // Pre-compute linear_layer_idx for GPU linear attention encoding in CMD1
-    int linear_layer_idx = -1;
-    if (!is_full) {
-        linear_layer_idx = layer_idx - (layer_idx + 1) / FULL_ATTN_INTERVAL;
-    }
-    // Can we run the full linear attention pipeline on GPU in CMD1?
-    int can_gpu_linear = (gpu_linear_attn_enabled &&
-                          !is_full && g_metal && g_metal->delta_net_step &&
-                          g_metal->conv1d_step && g_metal->rms_norm_qk &&
-                          g_metal->compute_decay_beta && g_metal->gated_rms_norm &&
-                          g_metal->wf_buf &&
-                          linear_layer_idx >= 0 && linear_layer_idx < NUM_LINEAR_LAYERS &&
-                          lc->conv1d_w && lc->A_log && lc->dt_bias && lc->gated_norm_w &&
-                          !linear_attn_bypass);
 
     // Check if previous layer's CMD3 already computed combine+residual+norm on GPU.
     // If so, buf_input already contains the normalized input for this layer's CMD1.
@@ -4094,98 +3748,6 @@ static void fused_layer_forward(
         cmd1 = [g_metal->queue commandBuffer];
         gpu_encode_batch_matvec(g_metal, cmd1, attn_specs, num_attn_specs);
 
-        // GPU linear attention: encode conv1d + normalize + decay/beta + delta-net + gated_norm into CMD1
-        if (can_gpu_linear && num_attn_specs == 4) {
-            // batch_out[0]=qkv(12288), [1]=z(8192), [2]=beta(64), [3]=alpha(64)
-            uint32_t conv_dim = LINEAR_CONV_DIM;
-            NSUInteger conv_w_off = (NSUInteger)((const char *)lc->conv1d_w - (const char *)[g_metal->wf_buf contents]);
-
-            // Enc L1: conv1d_step — input=batch_out[0], weights=conv1d_w, state=buf_conv_state, output=buf_conv_output
-            {
-                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->conv1d_step];
-                [enc setBuffer:g_metal->buf_conv_state[linear_layer_idx] offset:0 atIndex:0];
-                [enc setBuffer:g_metal->batch_out[0]    offset:0            atIndex:1]; // qkv projection output
-                [enc setBuffer:g_metal->wf_buf          offset:conv_w_off   atIndex:2]; // conv weights (bf16)
-                [enc setBuffer:g_metal->buf_conv_output offset:0            atIndex:3]; // conv output
-                [enc setBytes:&conv_dim length:4 atIndex:4];
-                uint32_t tgs = (conv_dim + 255) / 256;
-                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc endEncoding];
-            }
-
-            // Enc L2: rms_norm_qk — normalize q and k in conv_output in-place
-            {
-                uint32_t key_dim = LINEAR_KEY_DIM;  // 128
-                float inv_scale = 1.0f / sqrtf((float)LINEAR_KEY_DIM);
-                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->rms_norm_qk];
-                [enc setBuffer:g_metal->buf_conv_output offset:0 atIndex:0];  // q at offset 0
-                [enc setBuffer:g_metal->buf_conv_output offset:LINEAR_TOTAL_KEY * sizeof(float) atIndex:1];  // k at offset 2048 floats
-                [enc setBytes:&key_dim   length:4 atIndex:2];
-                [enc setBytes:&inv_scale length:4 atIndex:3];
-                [enc dispatchThreadgroups:MTLSizeMake(LINEAR_NUM_K_HEADS, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(LINEAR_KEY_DIM, 1, 1)];
-                [enc endEncoding];
-            }
-
-            // Enc L3: compute_decay_beta — alpha=batch_out[3], beta=batch_out[2], A_log+dt_bias from wf_buf
-            {
-                NSUInteger a_log_off   = (NSUInteger)((const char *)lc->A_log   - (const char *)[g_metal->wf_buf contents]);
-                NSUInteger dt_bias_off = (NSUInteger)((const char *)lc->dt_bias  - (const char *)[g_metal->wf_buf contents]);
-                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->compute_decay_beta];
-                [enc setBuffer:g_metal->batch_out[3]       offset:0          atIndex:0]; // alpha
-                [enc setBuffer:g_metal->batch_out[2]       offset:0          atIndex:1]; // beta
-                [enc setBuffer:g_metal->wf_buf             offset:a_log_off  atIndex:2]; // A_log
-                [enc setBuffer:g_metal->wf_buf             offset:dt_bias_off atIndex:3]; // dt_bias (bf16)
-                [enc setBuffer:g_metal->buf_delta_g_decay  offset:0          atIndex:4]; // g_decay output
-                [enc setBuffer:g_metal->buf_delta_beta     offset:0          atIndex:5]; // beta_gate output
-                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(LINEAR_NUM_V_HEADS, 1, 1)];
-                [enc endEncoding];
-            }
-
-            // Enc L4: gated_delta_net_step — the main recurrence
-            {
-                uint32_t khpv = LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS;  // 4
-                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->delta_net_step];
-                [enc setBuffer:g_metal->buf_delta_state[linear_layer_idx] offset:0 atIndex:0]; // persistent state
-                [enc setBuffer:g_metal->buf_conv_output offset:0 atIndex:1]; // q (first 2048 floats)
-                [enc setBuffer:g_metal->buf_conv_output offset:LINEAR_TOTAL_KEY * sizeof(float) atIndex:2]; // k (next 2048)
-                [enc setBuffer:g_metal->buf_conv_output offset:2 * LINEAR_TOTAL_KEY * sizeof(float) atIndex:3]; // v (next 8192)
-                [enc setBuffer:g_metal->buf_delta_g_decay offset:0 atIndex:4];
-                [enc setBuffer:g_metal->buf_delta_beta    offset:0 atIndex:5];
-                [enc setBuffer:g_metal->buf_delta_output  offset:0 atIndex:6]; // output [8192]
-                [enc setBytes:&khpv length:sizeof(khpv) atIndex:7];
-                [enc dispatchThreadgroups:MTLSizeMake(LINEAR_NUM_V_HEADS, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                [enc endEncoding];
-            }
-
-            // Enc L5: gated_rms_norm — normalize+gate delta-net output -> batch_out[6] for CMD2 o_proj
-            {
-                NSUInteger gnorm_w_off = (NSUInteger)((const char *)lc->gated_norm_w - (const char *)[g_metal->wf_buf contents]);
-                uint32_t value_dim = LINEAR_VALUE_DIM;  // 128
-                float eps = RMS_NORM_EPS;
-                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->gated_rms_norm];
-                [enc setBuffer:g_metal->buf_delta_output offset:0          atIndex:0]; // values [8192]
-                [enc setBuffer:g_metal->batch_out[1]     offset:0          atIndex:1]; // z (z projection output) [8192]
-                [enc setBuffer:g_metal->wf_buf           offset:gnorm_w_off atIndex:2]; // weight (bf16)
-                [enc setBuffer:g_metal->batch_out[6]     offset:0          atIndex:3]; // output -> batch_out[6] for CMD2
-                [enc setBytes:&value_dim length:4 atIndex:4];
-                [enc setBytes:&eps       length:4 atIndex:5];
-                [enc dispatchThreadgroups:MTLSizeMake(LINEAR_NUM_V_HEADS, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(LINEAR_VALUE_DIM, 1, 1)];
-                [enc endEncoding];
-            }
-
-            gpu_linear_attn = 1;
-        }
-
         [cmd1 commit];
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
@@ -4193,9 +3755,7 @@ static void fused_layer_forward(
         // Wait for CMD1 (implies CMD3(N-1) also done, since queue is serial)
         if (g_timing_enabled) { t0 = now_ms(); }
         [cmd1 waitUntilCompleted];
-        if (!gpu_linear_attn) {
-            gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
-        }
+        gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
 
         // Now CMD3(N-1) is done. Read back hidden state from GPU.
@@ -4244,97 +3804,6 @@ static void fused_layer_forward(
             cmd1 = [g_metal->queue commandBuffer];
             gpu_encode_batch_matvec(g_metal, cmd1, attn_specs, num_attn_specs);
 
-            // GPU linear attention: encode conv1d + normalize + decay/beta + delta-net + gated_norm into CMD1
-            if (can_gpu_linear && num_attn_specs == 4) {
-                uint32_t conv_dim = LINEAR_CONV_DIM;
-                NSUInteger conv_w_off = (NSUInteger)((const char *)lc->conv1d_w - (const char *)[g_metal->wf_buf contents]);
-
-                // Enc L1: conv1d_step
-                {
-                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                    [enc setComputePipelineState:g_metal->conv1d_step];
-                    [enc setBuffer:g_metal->buf_conv_state[linear_layer_idx] offset:0 atIndex:0];
-                    [enc setBuffer:g_metal->batch_out[0]    offset:0            atIndex:1];
-                    [enc setBuffer:g_metal->wf_buf          offset:conv_w_off   atIndex:2];
-                    [enc setBuffer:g_metal->buf_conv_output offset:0            atIndex:3];
-                    [enc setBytes:&conv_dim length:4 atIndex:4];
-                    uint32_t tgs = (conv_dim + 255) / 256;
-                    [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                    [enc endEncoding];
-                }
-
-                // Enc L2: rms_norm_qk
-                {
-                    uint32_t key_dim = LINEAR_KEY_DIM;
-                    float inv_scale = 1.0f / sqrtf((float)LINEAR_KEY_DIM);
-                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                    [enc setComputePipelineState:g_metal->rms_norm_qk];
-                    [enc setBuffer:g_metal->buf_conv_output offset:0 atIndex:0];
-                    [enc setBuffer:g_metal->buf_conv_output offset:LINEAR_TOTAL_KEY * sizeof(float) atIndex:1];
-                    [enc setBytes:&key_dim   length:4 atIndex:2];
-                    [enc setBytes:&inv_scale length:4 atIndex:3];
-                    [enc dispatchThreadgroups:MTLSizeMake(LINEAR_NUM_K_HEADS, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(LINEAR_KEY_DIM, 1, 1)];
-                    [enc endEncoding];
-                }
-
-                // Enc L3: compute_decay_beta
-                {
-                    NSUInteger a_log_off   = (NSUInteger)((const char *)lc->A_log   - (const char *)[g_metal->wf_buf contents]);
-                    NSUInteger dt_bias_off = (NSUInteger)((const char *)lc->dt_bias  - (const char *)[g_metal->wf_buf contents]);
-                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                    [enc setComputePipelineState:g_metal->compute_decay_beta];
-                    [enc setBuffer:g_metal->batch_out[3]       offset:0          atIndex:0];
-                    [enc setBuffer:g_metal->batch_out[2]       offset:0          atIndex:1];
-                    [enc setBuffer:g_metal->wf_buf             offset:a_log_off  atIndex:2];
-                    [enc setBuffer:g_metal->wf_buf             offset:dt_bias_off atIndex:3];
-                    [enc setBuffer:g_metal->buf_delta_g_decay  offset:0          atIndex:4];
-                    [enc setBuffer:g_metal->buf_delta_beta     offset:0          atIndex:5];
-                    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(LINEAR_NUM_V_HEADS, 1, 1)];
-                    [enc endEncoding];
-                }
-
-                // Enc L4: gated_delta_net_step
-                {
-                    uint32_t khpv = LINEAR_NUM_V_HEADS / LINEAR_NUM_K_HEADS;
-                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                    [enc setComputePipelineState:g_metal->delta_net_step];
-                    [enc setBuffer:g_metal->buf_delta_state[linear_layer_idx] offset:0 atIndex:0];
-                    [enc setBuffer:g_metal->buf_conv_output offset:0 atIndex:1];
-                    [enc setBuffer:g_metal->buf_conv_output offset:LINEAR_TOTAL_KEY * sizeof(float) atIndex:2];
-                    [enc setBuffer:g_metal->buf_conv_output offset:2 * LINEAR_TOTAL_KEY * sizeof(float) atIndex:3];
-                    [enc setBuffer:g_metal->buf_delta_g_decay offset:0 atIndex:4];
-                    [enc setBuffer:g_metal->buf_delta_beta    offset:0 atIndex:5];
-                    [enc setBuffer:g_metal->buf_delta_output  offset:0 atIndex:6];
-                    [enc setBytes:&khpv length:sizeof(khpv) atIndex:7];
-                    [enc dispatchThreadgroups:MTLSizeMake(LINEAR_NUM_V_HEADS, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-                    [enc endEncoding];
-                }
-
-                // Enc L5: gated_rms_norm -> batch_out[6]
-                {
-                    NSUInteger gnorm_w_off = (NSUInteger)((const char *)lc->gated_norm_w - (const char *)[g_metal->wf_buf contents]);
-                    uint32_t value_dim = LINEAR_VALUE_DIM;
-                    float eps = RMS_NORM_EPS;
-                    id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
-                    [enc setComputePipelineState:g_metal->gated_rms_norm];
-                    [enc setBuffer:g_metal->buf_delta_output offset:0          atIndex:0];
-                    [enc setBuffer:g_metal->batch_out[1]     offset:0          atIndex:1];
-                    [enc setBuffer:g_metal->wf_buf           offset:gnorm_w_off atIndex:2];
-                    [enc setBuffer:g_metal->batch_out[6]     offset:0          atIndex:3];
-                    [enc setBytes:&value_dim length:4 atIndex:4];
-                    [enc setBytes:&eps       length:4 atIndex:5];
-                    [enc dispatchThreadgroups:MTLSizeMake(LINEAR_NUM_V_HEADS, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(LINEAR_VALUE_DIM, 1, 1)];
-                    [enc endEncoding];
-                }
-
-                gpu_linear_attn = 1;
-            }
-
             [cmd1 commit];
         } else {
             for (int i = 0; i < num_attn_specs; i++) {
@@ -4349,9 +3818,7 @@ static void fused_layer_forward(
         if (g_timing_enabled) { t0 = now_ms(); }
         if (cmd1) {
             [cmd1 waitUntilCompleted];
-            if (!gpu_linear_attn) {
-                gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
-            }
+            gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
     }
@@ -4452,44 +3919,25 @@ static void fused_layer_forward(
     float *attn_projected = s_attn_proj;
     memset(attn_projected, 0, HIDDEN_DIM * sizeof(float));
 
-    // Pre-lookup o_proj / out_proj weights (used after attention compute)
-    // These are looked up NOW to avoid repeated snprintf later.
-    uint32_t *oproj_w = NULL;
-    uint16_t *oproj_s = NULL, *oproj_b = NULL;
-    int oproj_in_dim = 0;
+    // Pre-lookup o_proj weights (used after attention compute)
+    uint32_t *oproj_w = lc->o_w;
+    uint16_t *oproj_s = lc->o_s, *oproj_b = lc->o_b;
+    int oproj_in_dim = NUM_ATTN_HEADS * HEAD_DIM;  // 64*128 = 8192
 
-    if (is_full) {
-        oproj_w = lc->o_w; oproj_s = lc->o_s; oproj_b = lc->o_b;
-        oproj_in_dim = NUM_ATTN_HEADS * HEAD_DIM;
-    } else if (!linear_attn_bypass) {
-        oproj_w = lc->out_proj_w; oproj_s = lc->out_proj_s; oproj_b = lc->out_proj_b;
-        oproj_in_dim = LINEAR_TOTAL_VALUE;
-    }
-
-    // All MoE weight pointers from cache (zero snprintf overhead)
+    // MoE routing weight pointers from cache (no shared expert in Qwen3)
     uint32_t *gate_w = lc->gate_w; uint16_t *gate_s = lc->gate_s, *gate_b = lc->gate_b;
-    uint32_t *sgw = lc->sg_w;     uint16_t *sgs = lc->sg_s,       *sgb = lc->sg_b;
-    uint32_t *suw = lc->su_w;     uint16_t *sus = lc->su_s,       *sub = lc->su_b;
-    uint32_t *seg_w = lc->seg_w;  uint16_t *seg_s = lc->seg_s,   *seg_b = lc->seg_b;
-    uint32_t *sdw = lc->sd_w;     uint16_t *sds = lc->sd_s,       *sdb = lc->sd_b;
 
     // ---- CPU attention compute (produces attn_out for o_proj) ----
     float *attn_out_for_oproj = NULL;
 
-    if (is_full) {
-        // ---- Full attention CPU compute ----
-        int q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;
+    {
+        // ---- Standard GQA attention CPU compute (all layers) ----
         int q_dim = NUM_ATTN_HEADS * HEAD_DIM;
         int kv_dim = NUM_KV_HEADS * HEAD_DIM;
-        (void)q_proj_dim;
 
+        // Qwen3: q_proj_out is directly q (no gate split)
         float *q = s_q;
-        float *q_gate = s_q_gate;
-        for (int h = 0; h < NUM_ATTN_HEADS; h++) {
-            float *src = q_proj_out + h * (2 * HEAD_DIM);
-            memcpy(q + h * HEAD_DIM, src, HEAD_DIM * sizeof(float));
-            memcpy(q_gate + h * HEAD_DIM, src + HEAD_DIM, HEAD_DIM * sizeof(float));
-        }
+        memcpy(q, q_proj_out, q_dim * sizeof(float));
 
         // Q/K RMSNorm
         uint16_t *qnorm_w = lc->q_norm_w;
@@ -4521,11 +3969,10 @@ static void fused_layer_forward(
         memcpy(kv->k_cache + cache_pos * kv_dim, k_out, kv_dim * sizeof(float));
         memcpy(kv->v_cache + cache_pos * kv_dim, v_out, kv_dim * sizeof(float));
 
-        int fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
-        if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
-            memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
+        if (g_metal && g_metal->attn_scores_pipe && layer_idx >= 0 && layer_idx < NUM_LAYERS) {
+            memcpy((float *)[g_metal->buf_kv_k[layer_idx] contents] + cache_pos * kv_dim,
                    k_out, kv_dim * sizeof(float));
-            memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
+            memcpy((float *)[g_metal->buf_kv_v[layer_idx] contents] + cache_pos * kv_dim,
                    v_out, kv_dim * sizeof(float));
         }
         kv->len++;
@@ -4539,13 +3986,12 @@ static void fused_layer_forward(
         // GPU attention: defer dispatches to CMD2 (fused into single cmd buffer).
         // Only enabled when seq_len >= 32 (below that, CPU is faster).
         int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
-                              fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS &&
+                              layer_idx >= 0 && layer_idx < NUM_LAYERS &&
                               kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
         if (gpu_attn_ready) {
-            // Copy Q and gate to GPU; attention dispatches will be in CMD2
+            // Copy Q to GPU; attention dispatches will be in CMD2
             memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
-            memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
         } else {
             // CPU fallback
@@ -4567,10 +4013,7 @@ static void fused_layer_forward(
                 }
                 free(scores);
             }
-            for (int i = 0; i < q_dim; i++) {
-                float g = 1.0f / (1.0f + expf(-q_gate[i]));
-                attn_out[i] *= g;
-            }
+            // Qwen3: no sigmoid gate on attention output
         }
 
         if (gpu_attn_ready) {
@@ -4578,14 +4021,11 @@ static void fused_layer_forward(
         } else {
             attn_out_for_oproj = attn_out;
         }
-        // q_proj_out, k_out, v_out, q, q_gate, attn_out are static scratch.
-    } else if (gpu_linear_attn) {
-        // ---- GPU linear attention: already computed in CMD1 ----
-        // batch_out[6] already contains gated_rms_norm output (8192 floats)
-        // Set a non-NULL sentinel so CMD2 enters fused path, but skip the memcpy
-        static float gpu_linear_sentinel;
-        attn_out_for_oproj = &gpu_linear_sentinel;
-    } else {
+        // q_proj_out, k_out, v_out, q, attn_out are static scratch.
+    }
+    // (Linear attention CPU compute path removed — all layers use standard GQA)
+#if 0  // Dead code: linear attention CPU compute in fused_layer_forward
+    if (0) {
         // ---- Linear attention CPU compute ----
         if (!linear_attn_bypass) {
             int qkv_dim = LINEAR_CONV_DIM;
@@ -4744,6 +4184,7 @@ static void fused_layer_forward(
         // else: linear_attn_bypass — attn_projected stays zero
         // qkv_out, z_out, beta_out, alpha_out are static scratch.
     }
+#endif  // Dead code: linear attention CPU compute in fused_layer_forward
 
     // =====================================================================
     // PHASE 3: FULLY FUSED CMD2 — o_proj + residual + norm + routing (1 cmd buffer)
@@ -4767,19 +4208,13 @@ static void fused_layer_forward(
     float *h_mid = s_h_mid;
     float *gate_scores = s_gate_scores;
     memset(gate_scores, 0, NUM_EXPERTS * sizeof(float));
-    float *shared_gate = s_shared_gate;
-    memset(shared_gate, 0, SHARED_INTERMEDIATE * sizeof(float));
-    float *shared_up = s_shared_up;
-    memset(shared_up, 0, SHARED_INTERMEDIATE * sizeof(float));
-    float shared_gate_score = 0.0f;
 
-    int have_moe_weights = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
-                            suw && sus && sub && seg_w && seg_s && seg_b);
+    int have_moe_weights = (gate_w && gate_s && gate_b);
 
     // gpu_attn_fuse: attention dispatches fused into CMD2 (full-attn layers only).
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
     // because GPU command encoder overhead dominates at short sequences.
-    int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
+    int gpu_attn_fuse = (!attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
                          && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
     if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
@@ -4802,12 +4237,11 @@ static void fused_layer_forward(
         //   Enc 2-4: residual + norm -> buf_input
         //   Enc 5-8: routing + shared expert
 
-        if (!gpu_attn_fuse && !gpu_linear_attn) {
-            // CPU/linear attn: copy attention output to GPU input buffer
+        if (!gpu_attn_fuse) {
+            // CPU attn: copy attention output to GPU input buffer
             memcpy([g_metal->batch_out[6] contents], attn_out_for_oproj,
                    oproj_in_dim * sizeof(float));
         }
-        // gpu_linear_attn: batch_out[6] already has the result from CMD1 gated_rms_norm
         // Copy residual into GPU buffer for residual_add kernel
         memcpy([g_metal->buf_residual contents], residual, HIDDEN_DIM * sizeof(float));
 
@@ -4817,7 +4251,6 @@ static void fused_layer_forward(
 
         // ---- GPU attention dispatches (only for full-attn layers with GPU path) ----
         if (gpu_attn_fuse) {
-            int fa_idx = (layer_idx + 1) / FULL_ATTN_INTERVAL - 1;
             int kv_dim = NUM_KV_HEADS * HEAD_DIM;
             int heads_per_kv = NUM_ATTN_HEADS / NUM_KV_HEADS;
             float scale = 1.0f / sqrtf((float)HEAD_DIM);
@@ -4832,7 +4265,7 @@ static void fused_layer_forward(
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->attn_scores_pipe];
                 [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
-                [enc setBuffer:g_metal->buf_kv_k[fa_idx]    offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_kv_k[layer_idx]    offset:0 atIndex:1];
                 [enc setBuffer:g_metal->buf_attn_scores     offset:0 atIndex:2];
                 [enc setBytes:&hd        length:4 atIndex:3];
                 [enc setBytes:&kvd       length:4 atIndex:4];
@@ -4862,7 +4295,7 @@ static void fused_layer_forward(
                 id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->attn_values_pipe];
                 [enc setBuffer:g_metal->buf_attn_scores   offset:0 atIndex:0];
-                [enc setBuffer:g_metal->buf_kv_v[fa_idx]  offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_kv_v[layer_idx]  offset:0 atIndex:1];
                 [enc setBuffer:g_metal->buf_attn_out      offset:0 atIndex:2];
                 [enc setBytes:&hd        length:4 atIndex:3];
                 [enc setBytes:&kvd       length:4 atIndex:4];
@@ -4875,19 +4308,7 @@ static void fused_layer_forward(
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
             }
-            // Enc A4: sigmoid_gate
-            {
-                uint32_t qdim = NUM_ATTN_HEADS * HEAD_DIM;
-                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-                [enc setComputePipelineState:g_metal->sigmoid_gate_pipe];
-                [enc setBuffer:g_metal->buf_attn_out  offset:0 atIndex:0];
-                [enc setBuffer:g_metal->buf_attn_gate offset:0 atIndex:1];
-                [enc setBytes:&qdim length:4 atIndex:2];
-                uint32_t tgs = (qdim + 255) / 256;
-                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc endEncoding];
-            }
+            // Qwen3: no sigmoid gate on attention output
         }
 
         // ---- o_proj matvec ----
@@ -4966,25 +4387,22 @@ static void fused_layer_forward(
             [enc endEncoding];
         }
 
-        // ---- Enc 5-8: routing + shared expert projections (read buf_input) ----
-        BatchMatvecSpec moe_specs[4] = {
-            { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0 },
-            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1 },
-            { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2 },
-            { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3 },
+        // ---- Enc 5: routing gate projection (read buf_input) ----
+        BatchMatvecSpec moe_specs[1] = {
+            { gate_w, gate_s, gate_b, gate_scores, (uint32_t)NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE, 0 },
         };
         // buf_input already contains h_post from Enc 4 output -- no memcpy needed
-        gpu_encode_batch_matvec(g_metal, cmd_fused, moe_specs, 4);
+        gpu_encode_batch_matvec(g_metal, cmd_fused, moe_specs, 1);
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
 
-        // ---- Single commit+wait for all 8 encoders ----
+        // ---- Single commit+wait ----
         if (g_timing_enabled) { t0 = now_ms(); }
         [cmd_fused commit];
         [cmd_fused waitUntilCompleted];
 
         // Read back results
-        gpu_flush_batch_results(g_metal, moe_specs, 4);
+        gpu_flush_batch_results(g_metal, moe_specs, 1);
         // Read h_mid from GPU buffer (needed for final combine)
         memcpy(h_mid, [g_metal->buf_h_mid contents], HIDDEN_DIM * sizeof(float));
         // Read h_post from buf_input (needed for expert input)
@@ -5014,15 +4432,12 @@ static void fused_layer_forward(
         // Post-attention norm
         cpu_rms_norm(hidden, lc->post_attn_norm_w, h_post, HIDDEN_DIM, RMS_NORM_EPS);
 
-        // Routing + shared expert batch
+        // Routing gate only (no shared expert in Qwen3)
         if (have_moe_weights) {
-            BatchMatvecSpec moe_specs[4] = {
-                { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0 },
-                { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1 },
-                { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2 },
-                { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3 },
+            BatchMatvecSpec moe_specs[1] = {
+                { gate_w, gate_s, gate_b, gate_scores, (uint32_t)NUM_EXPERTS, HIDDEN_DIM, GROUP_SIZE, 0 },
             };
-            fast_batch_matvec(h_post, HIDDEN_DIM, moe_specs, 4);
+            fast_batch_matvec(h_post, HIDDEN_DIM, moe_specs, 1);
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
     }
@@ -5071,8 +4486,7 @@ static void fused_layer_forward(
     if (g_timing_enabled) { t0 = now_ms(); }
     float *moe_out = s_moe_out;
     memset(moe_out, 0, HIDDEN_DIM * sizeof(float));
-    float *shared_out = s_shared_out;
-    memset(shared_out, 0, HIDDEN_DIM * sizeof(float));
+    // (shared_out removed — no shared expert in Qwen3-235B)
 
     int actual_K = (K > MAX_K) ? MAX_K : K;
 
@@ -5275,12 +4689,8 @@ static void fused_layer_forward(
             }
         }
 
-        // Shared expert prep (doesn't need expert data — can overlap with async pread)
+        // Copy expert input (no shared expert in Qwen3)
         memcpy([g_metal->buf_multi_expert_input contents], h_post, HIDDEN_DIM * sizeof(float));
-        memcpy([g_metal->buf_shared_gate contents], shared_gate,
-               SHARED_INTERMEDIATE * sizeof(float));
-        memcpy([g_metal->buf_shared_up contents], shared_up,
-               SHARED_INTERMEDIATE * sizeof(float));
 
         // Wait for non-prediction async pread to complete
         if (!pred_started && g_async_pread.active) {
@@ -5312,32 +4722,7 @@ static void fused_layer_forward(
         id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
 
         gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
-
-        // Shared expert SwiGLU + down_proj (2 more encoders)
-        // Note: shared_gate/up already copied to GPU buffers above (before async pread wait)
-
-        // SwiGLU dispatch
-        {
-            id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
-            [enc setComputePipelineState:g_metal->swiglu];
-            [enc setBuffer:g_metal->buf_shared_gate offset:0 atIndex:0];
-            [enc setBuffer:g_metal->buf_shared_up   offset:0 atIndex:1];
-            [enc setBuffer:g_metal->buf_shared_act  offset:0 atIndex:2];
-            uint32_t dim = SHARED_INTERMEDIATE;
-            [enc setBytes:&dim length:4 atIndex:3];
-            uint32_t swiglu_tgs = (dim + 255) / 256;
-            [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
-        }
-
-        // Shared down_proj dispatch
-        if (sdw && sds && sdb) {
-            gpu_encode_dequant_matvec_with_io_bufs(
-                g_metal, cmd_experts, sdw, sds, sdb,
-                g_metal->buf_shared_act, g_metal->buf_shared_out,
-                HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
-        }
+        // (No shared expert in Qwen3-235B)
 
         // Step 4: GPU-side combine + residual + norm (if not last layer)
         // Appends dispatches to CMD3 so the next layer's CMD1 can submit immediately
@@ -5370,15 +4755,15 @@ static void fused_layer_forward(
                 for (int k = 0; k < actual_K; k++) {
                     params[k] = valid[k] ? expert_weights[k] : 0.0f;
                 }
-                params[8] = shared_gate_score;
+                params[8] = 0.0f;  // no shared expert gate in Qwen3
             }
 
-            // Enc C1: moe_combine_residual
+            // Enc C1: moe_combine_residual (no shared expert — shared_out buffer is unused/zero)
             {
                 id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->moe_combine_residual];
                 [enc setBuffer:g_metal->buf_h_mid         offset:0 atIndex:0];   // h_mid
-                [enc setBuffer:g_metal->buf_shared_out    offset:0 atIndex:1];   // shared_out
+                [enc setBuffer:g_metal->buf_moe_hidden    offset:0 atIndex:1];   // dummy (shared_out removed)
                 [enc setBuffer:g_metal->buf_moe_hidden    offset:0 atIndex:2];   // output: hidden
                 // Bind all 8 expert output buffers (unused ones have weight=0 in params)
                 for (int k = 0; k < MAX_K; k++) {
@@ -5444,7 +4829,7 @@ static void fused_layer_forward(
         g_deferred.gpu_combined = gpu_combine;
         g_deferred.cmd_experts = cmd_experts;
         g_deferred.actual_K = actual_K;
-        g_deferred.shared_gate_score = shared_gate_score;
+        g_deferred.shared_gate_score = 0.0f;  // no shared expert in Qwen3
         g_deferred.hidden = hidden;
         g_deferred.layer_idx = layer_idx;
         if (!gpu_combine) {
@@ -5479,14 +4864,14 @@ static void fused_layer_forward(
 
             // CPU fallback offsets — use 4-bit layout (2-bit CPU path not yet implemented)
             uint32_t *gw = (uint32_t *)expert_data;
-            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
+            uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 3145728));
+            uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 3342336));
+            uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 3538944));
+            uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 6684672));
+            uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 6881280));
+            uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 7077888));
+            uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 10223616));
+            uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 10420224));
 
             float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
             float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
@@ -5508,35 +4893,13 @@ static void fused_layer_forward(
             cpu_vec_madd(moe_out, expert_out_cpu, expert_weights[k], HIDDEN_DIM);
         }
         free(expert_out_cpu);
-
-        // CPU shared expert
-        float *shared_act = calloc(SHARED_INTERMEDIATE, sizeof(float));
-        cpu_swiglu(shared_gate, shared_up, shared_act, SHARED_INTERMEDIATE);
-        if (sdw && sds && sdb) {
-            cpu_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
-                               HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
-        }
-        free(shared_act);
     } else {
-        // No experts available -- still need shared expert
-        float *shared_act = calloc(SHARED_INTERMEDIATE, sizeof(float));
-        cpu_swiglu(shared_gate, shared_up, shared_act, SHARED_INTERMEDIATE);
-        if (sdw && sds && sdb) {
-            fast_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
-                                HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
-        }
-        free(shared_act);
+        // No experts available — nothing to combine
     }
 
-    // ---- Shared expert gate ----
-    float shared_weight = cpu_sigmoid(shared_gate_score);
+    // ---- Final combine: hidden = h_mid + moe_out (no shared expert in Qwen3) ----
     for (int i = 0; i < HIDDEN_DIM; i++) {
-        shared_out[i] *= shared_weight;
-    }
-
-    // ---- Final combine: hidden = h_mid + moe_out + shared_out ----
-    for (int i = 0; i < HIDDEN_DIM; i++) {
-        hidden[i] = h_mid[i] + moe_out[i] + shared_out[i];
+        hidden[i] = h_mid[i] + moe_out[i];
     }
 
     if (g_timing_enabled) {
@@ -5943,23 +5306,9 @@ static PromptTokens *tokenize_chat_message_old(const char *user_content) {
 
 // The main serve loop. Model state must already be initialized.
 // Sync CPU linear attention state → GPU buffers
+// (sync_cpu_to_gpu_delta_state_serve removed — no linear attention in Qwen3-235B)
 static void sync_cpu_to_gpu_delta_state_serve(void **layer_states) {
-    if (!g_metal || !g_metal->delta_net_step || !layer_states) return;
-    int li = 0;
-    for (int i = 0; i < NUM_LAYERS; i++) {
-        if ((i + 1) % FULL_ATTN_INTERVAL == 0) continue;
-        if (!layer_states[i]) { li++; continue; }
-        LinearAttnState *la = (LinearAttnState *)layer_states[i];
-        if (li < NUM_LINEAR_LAYERS) {
-            if (g_metal->buf_delta_state[li] && la->ssm_state)
-                memcpy([g_metal->buf_delta_state[li] contents], la->ssm_state,
-                       LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float));
-            if (g_metal->buf_conv_state[li] && la->conv_state)
-                memcpy([g_metal->buf_conv_state[li] contents], la->conv_state,
-                       (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float));
-        }
-        li++;
-    }
+    (void)layer_states;  // no-op
 }
 
 static void serve_loop(
@@ -6023,10 +5372,10 @@ static void serve_loop(
                 embed_lookup(wf, sys_pt->ids[i], hidden);
             }
             for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                int is_full = 1;  // All layers are standard GQA in Qwen3-235B
                 fused_layer_forward(wf, layer, hidden,
-                                    is_full ? kv_caches[layer] : NULL,
-                                    is_full ? NULL : layer_states[layer],
+                                    kv_caches[layer],
+                                    NULL,  /* no linear attention state */
                                     sys_pos,
                                     layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                     K, layer_fds[layer]);
@@ -6044,10 +5393,10 @@ static void serve_loop(
                 embed_lookup(wf, sys_pt->ids[0], hidden);
             }
             for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                int is_full = 1;  // All layers are standard GQA in Qwen3-235B
                 fused_layer_forward(wf, layer, hidden,
-                                    is_full ? kv_caches[layer] : NULL,
-                                    is_full ? NULL : layer_states[layer],
+                                    kv_caches[layer],
+                                    NULL,  /* no linear attention state */
                                     sys_pos,
                                     layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                     K, layer_fds[layer]);
@@ -6072,15 +5421,9 @@ static void serve_loop(
     KVSnapshot kv_snapshots[NUM_LAYERS];
     memset(kv_snapshots, 0, sizeof(kv_snapshots));
 
-    // Linear attention snapshots
-    float *la_conv_snapshots[NUM_LAYERS];
-    float *la_ssm_snapshots[NUM_LAYERS];
-    memset(la_conv_snapshots, 0, sizeof(la_conv_snapshots));
-    memset(la_ssm_snapshots, 0, sizeof(la_ssm_snapshots));
+    // (Linear attention snapshots removed — Qwen3-235B has no linear attention)
 
     size_t kv_dim = NUM_KV_HEADS * HEAD_DIM;
-    size_t conv_state_size = (CONV_KERNEL_SIZE - 1) * LINEAR_CONV_DIM * sizeof(float);
-    size_t ssm_state_size = LINEAR_NUM_V_HEADS * LINEAR_VALUE_DIM * LINEAR_KEY_DIM * sizeof(float);
 
     for (int i = 0; i < NUM_LAYERS; i++) {
         if (kv_caches[i]) {
@@ -6091,37 +5434,12 @@ static void serve_loop(
             memcpy(kv_snapshots[i].v_snapshot, kv_caches[i]->v_cache, sz);
             kv_snapshots[i].len = kv_caches[i]->len;
         }
-        if (layer_states[i]) {
-            LinearAttnState *s = (LinearAttnState *)layer_states[i];
-            la_conv_snapshots[i] = malloc(conv_state_size);
-            la_ssm_snapshots[i] = malloc(ssm_state_size);
-            memcpy(la_conv_snapshots[i], s->conv_state, conv_state_size);
-            memcpy(la_ssm_snapshots[i], s->ssm_state, ssm_state_size);
-        }
-    }
-    // Also snapshot GPU delta-net state
-    void *gpu_delta_snapshots[NUM_LINEAR_LAYERS];
-    void *gpu_conv_snapshots[NUM_LINEAR_LAYERS];
-    memset(gpu_delta_snapshots, 0, sizeof(gpu_delta_snapshots));
-    memset(gpu_conv_snapshots, 0, sizeof(gpu_conv_snapshots));
-    if (g_metal && g_metal->delta_net_step) {
-        for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
-            if (g_metal->buf_delta_state[i]) {
-                size_t sz = 64*128*128*sizeof(float);
-                gpu_delta_snapshots[i] = malloc(sz);
-                memcpy(gpu_delta_snapshots[i], [g_metal->buf_delta_state[i] contents], sz);
-            }
-            if (g_metal->buf_conv_state[i]) {
-                size_t sz = 3*12288*sizeof(float);
-                gpu_conv_snapshots[i] = malloc(sz);
-                memcpy(gpu_conv_snapshots[i], [g_metal->buf_conv_state[i] contents], sz);
-            }
-        }
+        // (no linear attention state to snapshot in Qwen3-235B)
     }
     int sys_prompt_len = sys_pos;  // number of tokens in system prompt cache
 
     // ---- Session state: track one active conversation session ----
-    // The KV caches + linear attention state ARE the session.
+    // The KV caches ARE the session.
     // We just track whether to restore from snapshot (new session) or continue (same session).
     char active_session_id[64] = {0};
     int session_pos = 0;  // RoPE position after last generation for the active session
@@ -6254,41 +5572,18 @@ static void serve_loop(
                         memcpy(kv_caches[i]->v_cache, kv_snapshots[i].v_snapshot, sz);
                         kv_caches[i]->len = kv_snapshots[i].len;
                         // Also restore GPU KV mirror
-                        if (g_metal) {
-                            int fa_idx = (i + 1) / FULL_ATTN_INTERVAL - 1;
-                            if (fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
-                                memcpy([g_metal->buf_kv_k[fa_idx] contents],
-                                       kv_snapshots[i].k_snapshot, sz);
-                                memcpy([g_metal->buf_kv_v[fa_idx] contents],
-                                       kv_snapshots[i].v_snapshot, sz);
-                            }
+                        if (g_metal && i < NUM_LAYERS) {
+                            memcpy([g_metal->buf_kv_k[i] contents],
+                                   kv_snapshots[i].k_snapshot, sz);
+                            memcpy([g_metal->buf_kv_v[i] contents],
+                                   kv_snapshots[i].v_snapshot, sz);
                         }
                     } else if (kv_caches[i]) {
                         kv_caches[i]->len = 0;
                     }
-                    if (layer_states[i] && la_conv_snapshots[i]) {
-                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
-                        memcpy(s->conv_state, la_conv_snapshots[i], conv_state_size);
-                        memcpy(s->ssm_state, la_ssm_snapshots[i], ssm_state_size);
-                    } else if (layer_states[i]) {
-                        LinearAttnState *s = (LinearAttnState *)layer_states[i];
-                        memset(s->conv_state, 0, conv_state_size);
-                        memset(s->ssm_state, 0, ssm_state_size);
-                    }
+                    // (no linear attention state to restore in Qwen3-235B)
                 }
-                // Restore GPU delta-net state
-                if (g_metal && g_metal->delta_net_step) {
-                    for (int i = 0; i < NUM_LINEAR_LAYERS; i++) {
-                        if (gpu_delta_snapshots[i] && g_metal->buf_delta_state[i])
-                            memcpy([g_metal->buf_delta_state[i] contents],
-                                   gpu_delta_snapshots[i], 64*128*128*sizeof(float));
-                        if (gpu_conv_snapshots[i] && g_metal->buf_conv_state[i])
-                            memcpy([g_metal->buf_conv_state[i] contents],
-                                   gpu_conv_snapshots[i], 3*12288*sizeof(float));
-                    }
-                } else {
-                    reset_delta_net_state();
-                }
+                // (no delta-net state to restore in Qwen3-235B)
                 pos = sys_prompt_len;  // start after cached system prompt
                 // Update active session
                 if (has_session) {
@@ -6323,7 +5618,7 @@ static void serve_loop(
                     embed_lookup(wf, pt->ids[i], hidden);
                 }
                 for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    int is_full = 1;  // All layers are standard GQA in Qwen3-235B
                     fused_layer_forward(wf, layer, hidden,
                                         is_full ? kv_caches[layer] : NULL,
                                         is_full ? NULL : layer_states[layer],
@@ -6344,7 +5639,7 @@ static void serve_loop(
                     embed_lookup(wf, pt->ids[0], hidden);
                 }
                 for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    int is_full = 1;  // All layers are standard GQA in Qwen3-235B
                     fused_layer_forward(wf, layer, hidden,
                                         is_full ? kv_caches[layer] : NULL,
                                         is_full ? NULL : layer_states[layer],
@@ -6389,7 +5684,7 @@ static void serve_loop(
                     cache_telemetry_note_token();
                     embed_lookup(wf, next_token, hidden);
                     for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                        int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                        int is_full = 1;  // All layers are standard GQA in Qwen3-235B
                         fused_layer_forward(wf, layer, hidden,
                                             is_full ? kv_caches[layer] : NULL,
                                             is_full ? NULL : layer_states[layer],
@@ -6431,7 +5726,7 @@ static void serve_loop(
                 cache_telemetry_note_token();
                 embed_lookup(wf, next_token, hidden);
                 for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    int is_full = 1;  // All layers are standard GQA in Qwen3-235B
                     fused_layer_forward(wf, layer, hidden,
                                         is_full ? kv_caches[layer] : NULL,
                                         is_full ? NULL : layer_states[layer],
@@ -6574,13 +5869,13 @@ int main(int argc, char **argv) {
                 case 'k': K = atoi(optarg); break;
                 case 'C': cache_entries = atoi(optarg); break;
                 case 'M': malloc_cache_entries = atoi(optarg); break;
-                case 'L': gpu_linear_attn_enabled = 0; break;
-                case 'S': linear_attn_bypass = 1; break;
+                case 'L': /* gpu_linear_attn_enabled removed — no linear attn in Qwen3 */ break;
+                case 'S': /* linear_attn_bypass removed — no linear attn in Qwen3 */ break;
                 case 'T': g_timing_enabled = 1; break;
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
-                case 'G': gpu_linear_attn_enabled = 1; break;
+                case 'G': /* gpu_linear_attn_enabled removed — no linear attn in Qwen3 */ break;
                 case 'D': g_pred_enabled = 1; break;
                 case 'Z':
                     g_routing_log = fopen(optarg, "wb");
@@ -6648,14 +5943,14 @@ int main(int argc, char **argv) {
             g_expert_cache = expert_cache_new(g_metal->device, cache_entries);
         }
 
-        printf("=== Qwen3.5-397B-A17B Metal Inference Engine ===\n");
+        printf("=== Qwen3-235B-A22B Metal Inference Engine ===\n");
         printf("Model:    %s\n", model_path);
         printf("Weights:  %s\n", weights_path);
         printf("Manifest: %s\n", manifest_path);
         printf("Vocab:    %s\n", vocab_path);
         printf("K:        %d experts/layer\n", K);
         printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
-        printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
+        printf("Attention: standard GQA (all %d layers)\n", NUM_LAYERS);
         printf("Tokens:   %d\n", max_tokens);
         if (g_malloc_cache) {
             printf("Cache:    malloc %d entries (%.1f GB)\n",
@@ -6837,16 +6132,12 @@ int main(int argc, char **argv) {
         }
 
         // ---- Allocate per-layer state ----
-        void **layer_states = calloc(NUM_LAYERS, sizeof(void *));
+        // Qwen3-235B: all 94 layers use standard GQA attention with KV cache
+        void **layer_states = calloc(NUM_LAYERS, sizeof(void *));  // unused, kept for API compat
         KVCache **kv_caches = calloc(NUM_LAYERS, sizeof(KVCache *));
 
         for (int i = 0; i < NUM_LAYERS; i++) {
-            int is_full = ((i + 1) % FULL_ATTN_INTERVAL == 0);
-            if (is_full) {
-                kv_caches[i] = kv_cache_new();
-            } else {
-                layer_states[i] = linear_attn_state_new();
-            }
+            kv_caches[i] = kv_cache_new();
         }
 
         double t_init = now_ms();
@@ -6859,7 +6150,7 @@ int main(int argc, char **argv) {
 
         // ---- Serve mode: enter HTTP server loop (never returns) ----
         if (serve_port > 0) {
-            reset_delta_net_state();
+            // (no delta-net state to reset in Qwen3-235B)
             serve_loop(serve_port, wf, vocab,
                        layer_states, kv_caches,
                        (void **)layer_mmaps, layer_fds,
@@ -6870,7 +6161,7 @@ int main(int argc, char **argv) {
         }
 
         // ---- Generate tokens ----
-        reset_delta_net_state();  // zero GPU delta-net state before generation
+        // (no delta-net state to reset in Qwen3-235B)  // zero GPU delta-net state before generation
         if (g_cache_telemetry_enabled) cache_telemetry_reset();
         printf("--- Generating %d tokens ---\n", max_tokens);
         int pos = 0;  // position counter for RoPE
@@ -6910,7 +6201,7 @@ int main(int argc, char **argv) {
 
                 // Run through all 60 transformer layers
                 for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                    int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                    int is_full = 1;  // All layers are standard GQA in Qwen3-235B
                     fused_layer_forward(wf, layer, hidden,
                                         is_full ? kv_caches[layer] : NULL,
                                         is_full ? NULL : layer_states[layer],
@@ -6948,10 +6239,10 @@ int main(int argc, char **argv) {
             }
 
             for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                int is_full = 1;  // All layers are standard GQA in Qwen3-235B
                 fused_layer_forward(wf, layer, hidden,
-                                    is_full ? kv_caches[layer] : NULL,
-                                    is_full ? NULL : layer_states[layer],
+                                    kv_caches[layer],
+                                    NULL,  /* no linear attention state */
                                     pos,
                                     layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                     K, layer_fds[layer]);
@@ -7035,10 +6326,10 @@ int main(int argc, char **argv) {
 
             // Run 60 layers (fused: 1+K cmd buffers per layer)
             for (int layer = 0; layer < NUM_LAYERS; layer++) {
-                int is_full = ((layer + 1) % FULL_ATTN_INTERVAL == 0);
+                int is_full = 1;  // All layers are standard GQA in Qwen3-235B
                 fused_layer_forward(wf, layer, hidden,
-                                    is_full ? kv_caches[layer] : NULL,
-                                    is_full ? NULL : layer_states[layer],
+                                    kv_caches[layer],
+                                    NULL,  /* no linear attention state */
                                     pos,
                                     layer_mmaps[layer] != MAP_FAILED ? layer_mmaps[layer] : NULL,
                                     K, layer_fds[layer]);
@@ -7135,7 +6426,7 @@ int main(int argc, char **argv) {
         }
         for (int i = 0; i < NUM_LAYERS; i++) {
             if (kv_caches[i]) kv_cache_free(kv_caches[i]);
-            if (layer_states[i]) linear_attn_state_free(layer_states[i]);
+            // (no linear attention state to free in Qwen3-235B)
             if (layer_mmaps[i] != MAP_FAILED) munmap(layer_mmaps[i], layer_mmap_sizes[i]);
             if (layer_fds[i] >= 0) close(layer_fds[i]);
             if (layer_fds_cold[i] >= 0) close(layer_fds_cold[i]);
